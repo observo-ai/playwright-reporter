@@ -1,0 +1,14 @@
+# Source + tests stay in git, only `dist/` ships to npm.
+src/
+tests/
+*.test.ts
+*.test.js
+vitest.config.ts
+tsconfig.json
+.github/
+.eslintrc*
+.editorconfig
+.gitignore
+.gitattributes
+node_modules/
+coverage/
