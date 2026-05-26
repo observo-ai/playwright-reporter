@@ -39,7 +39,9 @@ import type {
  *
  * Optional:
  *   - OBSERVO_RUN_KEY     attach to an existing run instead of creating one;
- *                         the reporter then SKIPS onBegin/onEnd run lifecycle
+ *                         the reporter then SKIPS onBegin/onEnd run lifecycle.
+ *                         Can also be passed as the `runKey` reporter option
+ *                         (option wins when both are set — see ReporterOptions).
  *   - OBSERVO_CLI_PATH    path to `observo` binary (default: from PATH)
  *
  * Activation: reporter no-ops entirely (zero CLI calls) unless
@@ -48,6 +50,23 @@ import type {
  */
 
 interface ReporterOptions {
+  /**
+   * Attach to an existing Observo run instead of creating one in
+   * `onBegin`. Takes precedence over the OBSERVO_RUN_KEY env var when
+   * both are set. When supplied (from either source), the reporter
+   * SKIPS `observo run create` in onBegin and `observo run finish` in
+   * onEnd — the orchestrator that pre-created the run owns its
+   * lifecycle.
+   *
+   * Passing this as an explicit option is preferred over the env var
+   * when wiring the reporter from a CI workflow that already plumbs
+   * the run id through Playwright config: it makes the "attach to
+   * existing run" intent visible at the config call site instead of
+   * relying on opaque env-to-config plumbing.
+   *
+   * Accepts either the run short key (e.g. `RUN-42`) or the run UUID.
+   */
+  runKey?: string;
   /**
    * Override the plan key used for `observo run create` when the
    * reporter creates the run itself (OBSERVO_RUN_KEY unset). Defaults
@@ -89,7 +108,11 @@ function resolveConfig(opts: ReporterOptions): ResolvedConfig | null {
     apiKey,
     project: process.env.OBSERVO_PROJECT || "",
     baseUrl: process.env.OBSERVO_BASE_URL || "",
-    runKey: process.env.OBSERVO_RUN_KEY || "",
+    // Option > env: an explicit `runKey` in playwright.config.ts is
+    // self-documenting and survives env churn (renames, missing exports).
+    // Env stays as the documented fallback so legacy wiring keeps
+    // working without a config change.
+    runKey: opts.runKey || process.env.OBSERVO_RUN_KEY || "",
     cliPath: process.env.OBSERVO_CLI_PATH || "observo",
     plan: opts.plan || process.env.OBSERVO_PLAN || "",
     uploadPassed: !!opts.uploadPassed,

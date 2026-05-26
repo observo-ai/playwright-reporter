@@ -118,6 +118,33 @@ describe("run lifecycle", () => {
     expect(spawnCalls).toHaveLength(0); // no run create
   });
 
+  it("attaches to an existing run when opts.runKey is set (no env required)", async () => {
+    // v0.1.1: explicit option path. Mirrors the env behaviour above but
+    // wires `runKey` through Playwright reporter options at the config
+    // call site — the self-documenting form.
+    process.env.OBSERVO_API_KEY = "k";
+    delete process.env.OBSERVO_RUN_KEY;
+    const r = new ObservoReporter({ runKey: "RUN-77" });
+    await r.onBegin({} as any, {} as any);
+    expect(spawnCalls).toHaveLength(0); // no run create — option populated cfg.runKey
+  });
+
+  it("opts.runKey takes precedence over OBSERVO_RUN_KEY env when both set", async () => {
+    // Tie-breaker: explicit option wins so a stray env in the runner
+    // never overrides what playwright.config.ts declared.
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "ENV-RUN";
+    const r = new ObservoReporter({ runKey: "OPT-RUN" });
+    await r.onBegin({} as any, {} as any);
+    expect(spawnCalls).toHaveLength(0); // still skips create
+    // Subsequent CLI calls use the option value, not the env value.
+    const test = fakeTest({ title: "OB-1 ping", tags: [] });
+    await r.onTestBegin(test as any, { status: "passed" } as any);
+    const args = spawnCalls.at(-1)?.args ?? [];
+    expect(args).toContain("OPT-RUN");
+    expect(args).not.toContain("ENV-RUN");
+  });
+
   it("calls run finish on onEnd only when reporter created the run", async () => {
     // 1. Reporter created the run: finish IS called.
     process.env.OBSERVO_API_KEY = "k";
