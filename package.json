@@ -1,0 +1,52 @@
+{
+  "name": "@observo-ai/playwright-reporter",
+  "version": "0.0.0",
+  "description": "Playwright reporter for Observo — streams live test status, retries, steps, and attachments to your Observo dashboard by shelling to the observo CLI.",
+  "keywords": [
+    "playwright",
+    "playwright-reporter",
+    "observo",
+    "ci",
+    "test-reporting",
+    "live-reporting"
+  ],
+  "homepage": "https://github.com/observo-ai/playwright-reporter",
+  "bugs": "https://github.com/observo-ai/playwright-reporter/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/observo-ai/playwright-reporter.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Observo <support@observoai.co>",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "peerDependencies": {
+    "@playwright/test": ">=1.30.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

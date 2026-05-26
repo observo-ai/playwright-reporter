@@ -1,0 +1,65 @@
+# Triggered on `v*` tag push. Builds the package and publishes to npm
+# under the @observo-ai org. The same tag also creates a GitHub
+# Release with the dist tarball attached so users on locked-down
+# networks can fetch it without npm registry access.
+#
+# Required secrets:
+#   - NPM_TOKEN: npm "automation" token from @observo-ai org
+#                (https://www.npmjs.com/settings/observo-ai/tokens).
+# `id-token: write` enables npm provenance — npm publishes a
+# signed attestation linking the published artifact to this exact
+# workflow run, visible at npm.com/package/.../provenance.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create GH release
+  id-token: write   # npm provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'npm'
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Set package version from tag
+        # Tag v0.1.0 → package.json version 0.1.0. --no-git-tag-version
+        # because the git tag already exists; we just sync the manifest
+        # before publish so npm doesn't pick up the placeholder "0.0.0".
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Pack tarball for GH release asset
+        run: npm pack
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tgz
+          generate_release_notes: true
