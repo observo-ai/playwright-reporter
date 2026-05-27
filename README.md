@@ -45,7 +45,7 @@ workflow secrets, shell profile):
 | Var | Required | Default | Notes |
 |---|---|---|---|
 | `OBSERVO_API_KEY` | yes | — | Account-scoped key from [Settings → API Keys](https://app.observoai.co/settings/api-keys) |
-| `OBSERVO_PROJECT` | yes | — | Project short code (e.g. `WEB`) or UUID |
+| `OBSERVO_PROJECT_CODE` | yes | — | Project short code (e.g. `WEB`) or UUID. Matches the env name the `observo` CLI itself documents — set this once in your CI workflow and both the CLI and the reporter see it. `OBSERVO_PROJECT` is still accepted as a fallback for backward compatibility. |
 | `OBSERVO_BASE_URL` | no | `https://api.observoai.co` | Override for self-hosted / staging |
 | `OBSERVO_RUN_KEY` | no | — | Attach to an existing run (e.g. created by CI orchestrator). When unset, the reporter creates a new run via `observo run create`. |
 | `OBSERVO_PLAN` | no | — | Plan key to associate the run with (only when reporter creates the run) |
@@ -106,7 +106,7 @@ reporter writes nothing for them and the run continues.
 | Event | Observo action |
 |---|---|
 | `onBegin` | Create a new run via `observo run create` (skipped when `OBSERVO_RUN_KEY` is set — orchestrator owns the lifecycle) |
-| `onTestBegin` | `observo run case set --status in_progress` |
+| `onTestBegin` | _no-op_ — case row is initialised in `not_started` and the dashboard surfaces it as in-flight while the run is open. (Prior versions tried to write a non-terminal `in_progress` status which the CLI does not accept; the writeback failed silently.) |
 | `onTestEnd` | `observo run case set` with the final status, plus per-step `observo run case step set` calls |
 | Failed/blocked cases | `observo run attach` for every path-backed `result.attachments[]` entry (`video.webm`, `trace.zip`, screenshots, custom test artifacts) |
 | `onEnd` | `observo run finish --status auto` (skipped when reporter didn't create the run) |
