@@ -137,12 +137,16 @@ describe("run lifecycle", () => {
     const r = new ObservoReporter({ runKey: "OPT-RUN" });
     await r.onBegin({} as any, {} as any);
     expect(spawnCalls).toHaveLength(0); // still skips create
-    // Subsequent CLI calls use the option value, not the env value.
-    const test = fakeTest({ title: "OB-1 ping", tags: [] });
-    await r.onTestBegin(test as any, { status: "passed" } as any);
-    const args = spawnCalls.at(-1)?.args ?? [];
-    expect(args).toContain("OPT-RUN");
-    expect(args).not.toContain("ENV-RUN");
+    // Subsequent CLI calls (onTestEnd writeback) use the option value,
+    // not the env value. onTestBegin no longer spawns (OB-372), so we
+    // sample the run-id from the case set call instead.
+    const test = fakeTest({ tags: ["@observo:OB-1"] });
+    await r.onTestEnd(test as any, fakeResult({ status: "passed" }));
+    const caseSet = spawnCalls.find(
+      (c) => c.args.includes("case") && c.args.includes("set"),
+    );
+    expect(caseSet?.args).toContain("OPT-RUN");
+    expect(caseSet?.args).not.toContain("ENV-RUN");
   });
 
   it("calls run finish on onEnd only when reporter created the run", async () => {
@@ -255,6 +259,88 @@ describe("retry handling", () => {
       (c) => c.args.includes("case") && c.args.includes("set"),
     );
     expect(caseSet?.args).toContain("passed");
+  });
+});
+
+describe("project resolution (OB-372)", () => {
+  it("reads OBSERVO_PROJECT_CODE (CLI's canonical env name)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_PROJECT_CODE = "OB";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:OB-7"] }),
+      fakeResult({ status: "passed" }),
+    );
+    const caseSet = spawnCalls.find(
+      (c) => c.args.includes("case") && c.args.includes("set"),
+    );
+    expect(caseSet?.args).toEqual(
+      expect.arrayContaining(["--project", "OB"]),
+    );
+  });
+
+  it("OBSERVO_PROJECT_CODE wins over OBSERVO_PROJECT (CLI name preferred)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_PROJECT_CODE = "CANONICAL";
+    process.env.OBSERVO_PROJECT = "LEGACY";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:OB-7"] }),
+      fakeResult({ status: "passed" }),
+    );
+    const caseSet = spawnCalls.find(
+      (c) => c.args.includes("case") && c.args.includes("set"),
+    );
+    expect(caseSet?.args).toContain("CANONICAL");
+    expect(caseSet?.args).not.toContain("LEGACY");
+  });
+
+  it("passes --project on case + step + attach when project is known", async () => {
+    // Multi-job CI: --project + --run-id together let `run case step
+    // set` succeed without a local .observo-pipeline-state.json.
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_PROJECT_CODE = "OB";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:OB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [{ title: "step 1", category: "test.step", steps: [] }],
+        attachments: [{ name: "trace", path: "/tmp/t.zip" }],
+      }),
+    );
+    // All three CLI verbs land in the spawn list with --project.
+    const verbs = ["set", "step", "attach"];
+    for (const verb of verbs) {
+      const match = spawnCalls.find((c) => c.args.includes(verb));
+      expect(match, `no spawn found for verb ${verb}`).toBeDefined();
+      expect(match?.args).toEqual(
+        expect.arrayContaining(["--project", "OB"]),
+      );
+    }
+  });
+});
+
+describe("onTestBegin no-op (OB-372)", () => {
+  it("does NOT spawn CLI on test begin (CLI rejects in_progress status)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_PROJECT_CODE = "OB";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    r.onTestBegin(
+      fakeTest({ tags: ["@observo:OB-7"] }) as any,
+      fakeResult({}) as any,
+    );
+    expect(spawnCalls).toHaveLength(0);
   });
 });
 

@@ -34,7 +34,9 @@ import type {
  *   - OBSERVO_API_KEY     account-scoped API key
  *
  * Recommended:
- *   - OBSERVO_PROJECT     project UUID or short code (`MYAPP`)
+ *   - OBSERVO_PROJECT_CODE   project UUID or short code (`MYAPP`). Matches
+ *                            the CLI's own env name. OBSERVO_PROJECT is
+ *                            accepted as a legacy fallback.
  *   - OBSERVO_BASE_URL    default https://api.observoai.co
  *
  * Optional:
@@ -106,7 +108,13 @@ function resolveConfig(opts: ReporterOptions): ResolvedConfig | null {
   if (!apiKey) return null; // hard activation gate
   return {
     apiKey,
-    project: process.env.OBSERVO_PROJECT || "",
+    // OBSERVO_PROJECT_CODE is the canonical env name the observo CLI
+    // itself documents; OBSERVO_PROJECT is the original name this
+    // reporter shipped with in v0.1.x. Read both, prefer the CLI's
+    // canonical one so a CI workflow that follows the CLI docs Just
+    // Works without an extra reporter-specific env (OB-372).
+    project:
+      process.env.OBSERVO_PROJECT_CODE || process.env.OBSERVO_PROJECT || "",
     baseUrl: process.env.OBSERVO_BASE_URL || "",
     // Option > env: an explicit `runKey` in playwright.config.ts is
     // self-documenting and survives env churn (renames, missing exports).
@@ -210,7 +218,9 @@ class ObservoReporter implements Reporter {
       "create",
       "--json",
     ];
-    if (this.cfg.project) args.push("--project", this.cfg.project);
+    // --project is added by commonArgs() — kept centralized so every
+    // subcommand (notably `run case step set`, which requires it)
+    // sees it consistently.
     if (this.cfg.plan) args.push("--plan", this.cfg.plan);
     const commit = process.env.GITHUB_SHA;
     if (commit) args.push("--commit", commit);
@@ -237,24 +247,18 @@ class ObservoReporter implements Reporter {
     }
   }
 
-  onTestBegin(test: TestCase, _result: TestResult): void {
-    if (!this.cfg) return;
-    const code = extractShortCode(test);
-    if (!code) return;
-    // Mark the case in-progress so the dashboard shows it lit up as
-    // the suite walks through it (the whole reason a customer reaches
-    // for a live reporter over CLI bulk import).
-    this.fireAndForget([
-      "run",
-      "case",
-      "set",
-      "--run-id",
-      this.runKey,
-      "--code",
-      code,
-      "--status",
-      "in_progress",
-    ]);
+  onTestBegin(_test: TestCase, _result: TestResult): void {
+    // No-op (OB-372): we used to spawn `observo run case set --status
+    // in_progress` here so the dashboard lit a case up as the suite
+    // walked through it. The CLI never accepted `in_progress` though
+    // — allowed statuses are passed/failed/skipped/blocked — so every
+    // CI invocation logged a hard error and the writeback failed.
+    //
+    // The cost of dropping the live mid-test indicator is small: the
+    // dashboard still updates progressively as onTestEnd fires per
+    // case, and the run UI distinguishes "not_started" cases anyway.
+    // Re-introduce this if/when the CLI grows a `running` (or similar
+    // non-terminal) status — until then, silence beats spammy errors.
   }
 
   async onTestEnd(test: TestCase, result: TestResult): Promise<void> {
@@ -384,13 +388,22 @@ class ObservoReporter implements Reporter {
 
   /**
    * Build the common arg prefix every CLI invocation needs: --api-key,
-   * --base-url (when set). Project is per-subcommand — only some verbs
-   * accept it.
+   * --base-url (when set), --project (when known).
+   *
+   * OB-372: `--project` is now passed on every invocation. The CLI's
+   * subcommands (notably `run case step set`) require both --project
+   * AND --run-id when no local `.observo-pipeline-state.json` is
+   * present — which is the common case for multi-job CI pipelines
+   * where `run create` runs in an upstream job and the test job
+   * starts with a clean workspace. Pre-existing subcommands that
+   * accept --project but don't require it (run create, run finish)
+   * are happy to receive it redundantly.
    */
   private commonArgs(): string[] {
     if (!this.cfg) return [];
     const out: string[] = ["--api-key", this.cfg.apiKey];
     if (this.cfg.baseUrl) out.push("--base-url", this.cfg.baseUrl);
+    if (this.cfg.project) out.push("--project", this.cfg.project);
     return out;
   }
 
