@@ -6,6 +6,18 @@ import { EventEmitter } from "node:events";
 // shared array so the test body can assert against it.
 const spawnCalls: { cmd: string; args: string[] }[] = [];
 
+// Per-test override for the mocked spawn's exit code / stderr / stdout.
+// Returning `null` (the default) keeps the legacy behaviour: exit 0,
+// stdout JSON only for `run create` calls. Used by OB-373 tests that
+// need to assert reporter behaviour on a non-zero CLI exit (e.g. the
+// step-number 404 path).
+type SpawnOverride = {
+  stdout?: string;
+  stderr?: string;
+  exitCode?: number;
+};
+let spawnBehavior: (args: string[]) => SpawnOverride | null = () => null;
+
 vi.mock("node:child_process", () => {
   return {
     spawn: (cmd: string, args: string[]) => {
@@ -22,16 +34,29 @@ vi.mock("node:child_process", () => {
       // Allow the test to intercept stdout for runCli (run create)
       // before we close — push canned JSON when args match.
       setImmediate(() => {
-        const idx = args.indexOf("create");
-        if (idx >= 0 && args[idx - 1] === "run") {
-          ee.stdout.emit("data", JSON.stringify({ run_key: "RUN-42" }));
+        const override = spawnBehavior(args);
+        if (override?.stdout !== undefined) {
+          ee.stdout.emit("data", override.stdout);
+        } else {
+          const idx = args.indexOf("create");
+          if (idx >= 0 && args[idx - 1] === "run") {
+            ee.stdout.emit("data", JSON.stringify({ run_key: "RUN-42" }));
+          }
         }
-        ee.emit("close", 0);
+        if (override?.stderr) ee.stderr.emit("data", override.stderr);
+        ee.emit("close", override?.exitCode ?? 0);
       });
       return ee;
     },
   };
 });
+
+// Drain pending setImmediate / microtask queue so reporter's
+// fire-and-forget `child.on("close", ...)` callbacks have actually
+// fired before the test asserts against logged warnings.
+async function flushAsync(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 // Import AFTER vi.mock so the reporter binds to the mocked spawn.
 import ObservoReporter from "../src/reporter";
@@ -72,8 +97,17 @@ function fakeResult(opts: {
 
 const ORIGINAL_ENV = { ...process.env };
 
-beforeEach(() => {
+beforeEach(async () => {
+  // Drain any setImmediate callbacks queued by prior tests' fire-
+  // and-forget spawns BEFORE we reset spawnBehavior. Otherwise a
+  // close handler queued by test N runs under test N+1's spawn
+  // override and fires warnings against a stale reporter instance —
+  // pollutes the next test's console.warn spy without dedupe
+  // protection (the prior reporter's per-case Set is unrelated to
+  // the new test's reporter).
+  await new Promise<void>((resolve) => setImmediate(resolve));
   spawnCalls.length = 0;
+  spawnBehavior = () => null;
   // Reset env to a known-clean state per test.
   for (const k of Object.keys(process.env)) {
     if (k.startsWith("OBSERVO_")) delete process.env[k];
@@ -452,5 +486,236 @@ describe("steps", () => {
     expect(stepCalls).toHaveLength(2);
     expect(stepCalls[0].args).toContain("1");
     expect(stepCalls[1].args).toContain("2");
+  });
+});
+
+// -----------------------------------------------------------------
+// OB-373 — reporter ↔ CLI v0.7.x contract gaps closed in v0.1.3.
+// -----------------------------------------------------------------
+
+describe("OB-373: run case set does not pass unknown --comment flag", () => {
+  it("omits --comment on case set even when the test has an error message", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        error: { message: "expect.toBe failed", stack: "at line 42" },
+      }),
+    );
+    const caseSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("set") &&
+        !c.args.includes("step"),
+    );
+    expect(caseSet).toBeTruthy();
+    // CLI v0.7.x's `run case set` does NOT declare --comment;
+    // passing one would log `unknown flag: --comment` and the case
+    // row would land without a status. Verified flag is absent.
+    expect(caseSet!.args).not.toContain("--comment");
+    expect(caseSet!.args).toContain("--status");
+    expect(caseSet!.args).toContain("failed");
+  });
+
+  it("keeps per-step --comment when the step has an error (CLI does accept --comment on step set)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [
+          {
+            title: "click login",
+            category: "test.step",
+            steps: [],
+            error: { message: "selector not found" },
+          },
+        ],
+      }),
+    );
+    const stepSet = spawnCalls.find(
+      (c) => c.args.includes("step") && c.args.includes("set"),
+    );
+    expect(stepSet).toBeTruthy();
+    expect(stepSet!.args).toContain("--comment");
+    expect(stepSet!.args).toContain("selector not found");
+  });
+});
+
+describe("OB-373: run attach is run-scoped (no --code)", () => {
+  it("does NOT pass --code on attach (CLI v0.7.x rejects it)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        attachments: [{ name: "trace", path: "/tmp/trace.zip" }],
+      }),
+    );
+    const attach = spawnCalls.find((c) => c.args.includes("attach"));
+    expect(attach).toBeTruthy();
+    expect(attach!.args).not.toContain("--code");
+    expect(attach!.args).toContain("--file");
+    expect(attach!.args).toContain("/tmp/trace.zip");
+    expect(attach!.args).toContain("--run-id");
+    expect(attach!.args).toContain("RUN-99");
+  });
+});
+
+describe("OB-373: step-number 404 is benign (deduped per case)", () => {
+  it("warns once per case when CLI returns step-not-found, silent on subsequent steps", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    // Make every `run case step set` spawn exit non-zero with the
+    // exact stderr shape the server emits on over-count steps.
+    spawnBehavior = (args) => {
+      if (
+        args.includes("step") &&
+        args.includes("set") &&
+        args[args.indexOf("step") - 1] === "case"
+      ) {
+        return {
+          stderr:
+            "HTTP 404 on /api/runs/x/cases/WEB-7/steps/5: step number 5 not found for test case",
+          exitCode: 1,
+        };
+      }
+      return null;
+    };
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    // Three over-count steps in a single test — the reporter should
+    // collapse to one warning for the case, not three.
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [
+          { title: "s1", category: "test.step", steps: [] },
+          { title: "s2", category: "test.step", steps: [] },
+          { title: "s3", category: "test.step", steps: [] },
+        ],
+      }),
+    );
+    await flushAsync();
+
+    const stepNotFoundLogs = warnSpy.mock.calls
+      .map((c) => String(c[0] ?? ""))
+      .filter((s) => s.includes("over-count steps skipped"));
+    expect(stepNotFoundLogs).toHaveLength(1);
+    expect(stepNotFoundLogs[0]).toContain("WEB-7");
+
+    // Equally important: the GENERIC "CLI ... exit 1: ..." warning
+    // path must NOT fire for these step-set calls — otherwise the
+    // dedupe achieved nothing for the operator reading CI logs.
+    const noisyLogs = warnSpy.mock.calls
+      .map((c) => String(c[0] ?? ""))
+      .filter((s) => s.includes("CLI run case exit"));
+    expect(noisyLogs).toHaveLength(0);
+
+    warnSpy.mockRestore();
+  });
+});
+
+describe("OB-373: pipeline-layer aggregate in onEnd", () => {
+  it("emits `run pipeline-layer set` with junit path auto-detected from FullConfig.reporter[]", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    const fullConfig = {
+      reporter: [
+        ["list"],
+        ["junit", { outputFile: "playwright-report/junit.xml" }],
+      ],
+    } as any;
+    await r.onBegin(fullConfig, {} as any);
+    spawnCalls.length = 0;
+    await r.onEnd({ status: "passed" } as any);
+    const layerSet = spawnCalls.find(
+      (c) => c.args.includes("pipeline-layer") && c.args.includes("set"),
+    );
+    expect(layerSet).toBeTruthy();
+    expect(layerSet!.args).toContain("--layer-id");
+    expect(layerSet!.args).toContain("e2e");
+    expect(layerSet!.args).toContain("--framework");
+    expect(layerSet!.args).toContain("playwright");
+    expect(layerSet!.args).toContain("--junit");
+    expect(layerSet!.args).toContain("playwright-report/junit.xml");
+    expect(layerSet!.args).toContain("--run-id");
+    expect(layerSet!.args).toContain("RUN-99");
+  });
+
+  it("skips emission with a warning when no junit reporter is configured", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = new ObservoReporter();
+    await r.onBegin({ reporter: [["list"]] } as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onEnd({ status: "passed" } as any);
+    expect(
+      spawnCalls.some(
+        (c) => c.args.includes("pipeline-layer") && c.args.includes("set"),
+      ),
+    ).toBe(false);
+    const skipLogs = warnSpy.mock.calls
+      .map((c) => String(c[0] ?? ""))
+      .filter((s) => s.includes("pipeline-layer skipped"));
+    expect(skipLogs).toHaveLength(1);
+    warnSpy.mockRestore();
+  });
+
+  it("honours option overrides (layerId / displayName / framework / junitPath)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter({
+      pipelineLayer: {
+        layerId: "smoke",
+        displayName: "Smoke (Playwright)",
+        framework: "playwright",
+        junitPath: "custom/path/junit.xml",
+      },
+    });
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onEnd({ status: "passed" } as any);
+    const layerSet = spawnCalls.find(
+      (c) => c.args.includes("pipeline-layer") && c.args.includes("set"),
+    );
+    expect(layerSet).toBeTruthy();
+    expect(layerSet!.args).toContain("smoke");
+    expect(layerSet!.args).toContain("Smoke (Playwright)");
+    expect(layerSet!.args).toContain("custom/path/junit.xml");
+  });
+
+  it("does not emit when pipelineLayer is explicitly disabled (false)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter({ pipelineLayer: false });
+    const fullConfig = {
+      reporter: [["junit", { outputFile: "playwright-report/junit.xml" }]],
+    } as any;
+    await r.onBegin(fullConfig, {} as any);
+    spawnCalls.length = 0;
+    await r.onEnd({ status: "passed" } as any);
+    expect(
+      spawnCalls.some(
+        (c) => c.args.includes("pipeline-layer") && c.args.includes("set"),
+      ),
+    ).toBe(false);
   });
 });

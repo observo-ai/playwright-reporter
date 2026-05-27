@@ -107,9 +107,9 @@ reporter writes nothing for them and the run continues.
 |---|---|
 | `onBegin` | Create a new run via `observo run create` (skipped when `OBSERVO_RUN_KEY` is set — orchestrator owns the lifecycle) |
 | `onTestBegin` | _no-op_ — case row is initialised in `not_started` and the dashboard surfaces it as in-flight while the run is open. (Prior versions tried to write a non-terminal `in_progress` status which the CLI does not accept; the writeback failed silently.) |
-| `onTestEnd` | `observo run case set` with the final status, plus per-step `observo run case step set` calls |
-| Failed/blocked cases | `observo run attach` for every path-backed `result.attachments[]` entry (`video.webm`, `trace.zip`, screenshots, custom test artifacts) |
-| `onEnd` | `observo run finish --status auto` (skipped when reporter didn't create the run) |
+| `onTestEnd` | `observo run case set` with the final status, plus per-step `observo run case step set` calls. Per-step `--comment` carries the step's error message; the case-level row itself does NOT carry the full stack — the failure context survives via the failing step's comment and any attached `trace.zip` / video / screenshot. |
+| Failed/blocked cases | `observo run attach` for every path-backed `result.attachments[]` entry (`video.webm`, `trace.zip`, screenshots, custom test artifacts). Attachments are **run-scoped**, not case-scoped — Playwright's attachment path (`test-results/<spec>/<test>/<artifact>`) preserves the spec context in the file name. |
+| `onEnd` | `observo run pipeline-layer set` for the `e2e` layer (so `observo run finish --status auto` sees the Playwright outcome alongside backend layers), then `observo run finish --status auto` (the latter is skipped when reporter didn't create the run). The pipeline-layer emission requires Playwright's built-in `junit` reporter to be configured with an `outputFile` — see [Pipeline-layer aggregate](#pipeline-layer-aggregate) below. |
 
 ### Status mapping
 
@@ -159,6 +159,45 @@ reporter: [
 |---|---|---|
 | `plan` | `OBSERVO_PLAN` env | Plan key passed to `observo run create` (no-op when `OBSERVO_RUN_KEY` is set) |
 | `uploadPassed` | `false` | Upload attachments on passed/skipped tests. Default off to keep dashboard storage bounded on green runs. |
+| `pipelineLayer` | `{ layerId: 'e2e', displayName: 'E2E (Playwright)', framework: 'playwright', junitPath: auto }` | Override the pipeline-layer aggregate emitted in `onEnd`, or pass `false` to disable. See below. |
+
+### Pipeline-layer aggregate
+
+In `onEnd` the reporter calls `observo run pipeline-layer set` so the
+run row's `--status auto` rollup includes the Playwright pass/fail
+outcome alongside other CI layers (frontend-unit, mcp-contract, etc.).
+The CLI parses Playwright's JUnit XML for aggregates, so this requires
+the built-in `junit` reporter with an `outputFile`:
+
+```ts
+reporter: [
+  ['list'],
+  ['junit', { outputFile: 'playwright-report/junit.xml' }],
+  ['@observo-ai/playwright-reporter'],
+],
+```
+
+If no `junit` reporter is configured (and no `junitPath` override is
+passed), the emission is skipped with a single warning line — per-case
+PATCHes continue to work and the run is unaffected; only the
+auto-status rollup loses the e2e signal.
+
+To customise the layer name, framework hint, or junit path:
+
+```ts
+['@observo-ai/playwright-reporter', {
+  pipelineLayer: {
+    layerId: 'smoke',
+    displayName: 'Smoke (Playwright)',
+    framework: 'playwright',
+    junitPath: 'reports/smoke-junit.xml',
+  },
+}]
+```
+
+Pass `pipelineLayer: false` to disable the emission entirely (e.g. if
+your orchestrator workflow already calls `pipeline-layer set` itself
+from a downstream CI step).
 
 ## Coexistence with `observo run import`
 
