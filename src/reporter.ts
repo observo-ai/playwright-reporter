@@ -81,6 +81,34 @@ interface ReporterOptions {
    * dashboard storage bounded on green runs.
    */
   uploadPassed?: boolean;
+  /**
+   * Emit a `pipeline.layers[]` aggregate in `onEnd` so `observo run
+   * finish --status auto` (called by the orchestrator) can see the
+   * Playwright pass/fail outcome alongside the other CI layers. Pass
+   * `false` to disable entirely; pass an object to override the
+   * defaults below.
+   *
+   * The aggregate is sourced from the JUnit reporter's `outputFile`
+   * — Playwright already produces the XML when the `junit` reporter
+   * is configured (recommended for CI). When no `junit` reporter is
+   * found in the Playwright config and `junitPath` is not supplied,
+   * the emission is skipped with a one-line warning; per-case
+   * PATCHes continue to work and are unaffected.
+   *
+   * Defaults:
+   *   layerId      = "e2e"
+   *   displayName  = "E2E (Playwright)"
+   *   framework    = "playwright"
+   *   junitPath    = auto-detected from FullConfig.reporter[]
+   */
+  pipelineLayer?:
+    | false
+    | {
+        layerId?: string;
+        displayName?: string;
+        framework?: string;
+        junitPath?: string;
+      };
 }
 
 interface ResolvedConfig {
@@ -186,17 +214,60 @@ function userSteps(steps: readonly TestStep[]): TestStep[] {
   return steps.filter((s) => s.category === "test.step");
 }
 
+/**
+ * Locate the JUnit reporter's outputFile in Playwright's FullConfig so
+ * the reporter can hand it to `observo run pipeline-layer set` in
+ * onEnd. The CLI parses JUnit XML for total/passed/failed/duration_ms
+ * — there's no direct numeric-flag mode today (v0.7.x) — so this is
+ * the only path to emit a layer aggregate from the reporter.
+ *
+ * Returns `null` when no `junit` reporter is configured OR when it's
+ * configured without an `outputFile` (junit-to-stdout has no file to
+ * upload). Caller logs a single warning in that case and skips the
+ * layer emission; per-case writeback is unaffected.
+ */
+function findJunitOutput(config: FullConfig): string | null {
+  // Playwright's ReporterDescription is `string | readonly [name, opts?]`
+  // — accept both shapes defensively (older Playwright versions may
+  // expose the array form even for one-arg reporters).
+  const reporters = (config as { reporter?: unknown }).reporter;
+  if (!Array.isArray(reporters)) return null;
+  for (const entry of reporters) {
+    let name: string | undefined;
+    let opts: { outputFile?: string } | undefined;
+    if (typeof entry === "string") {
+      name = entry;
+    } else if (Array.isArray(entry)) {
+      name = entry[0] as string | undefined;
+      opts = entry[1] as { outputFile?: string } | undefined;
+    }
+    if (name === "junit" && opts?.outputFile) {
+      return String(opts.outputFile);
+    }
+  }
+  return null;
+}
+
 class ObservoReporter implements Reporter {
   private opts: ReporterOptions;
   private cfg: ResolvedConfig | null = null;
   private runKey: string = ""; // resolved at onBegin (either env or created)
   private createdRun: boolean = false; // tracks whether we owe an onEnd finish
+  private fullConfig: FullConfig | null = null; // stashed in onBegin for onEnd's pipeline-layer junit lookup
+  // OB-373 finding #3: cases that already emitted a benign "step number
+  // N not found" 404 once. Playwright specs frequently emit more
+  // `test.step()` calls than the Observo case has step rows — the
+  // over-count steps hit a 404 per step, which spams CI logs without
+  // adding signal. We surface ONE info-level line per case and stay
+  // silent for subsequent occurrences within the same test run.
+  private stepNotFoundWarnedFor: Set<string> = new Set();
 
   constructor(opts: ReporterOptions = {}) {
     this.opts = opts;
   }
 
   async onBegin(config: FullConfig, _suite: Suite): Promise<void> {
+    this.fullConfig = config;
     this.cfg = resolveConfig(this.opts);
     if (!this.cfg) {
       // Silent no-op — user didn't ask for Observo integration.
@@ -284,11 +355,19 @@ class ObservoReporter implements Reporter {
     }
 
     const status = mapStatus(result.status);
-    const comment = result.error?.message
-      ? `${result.error.message}${result.error.stack ? `\n\n${result.error.stack}` : ""}`
-      : "";
 
     // 1. Case status.
+    //
+    // OB-373 finding #2: previously appended `--comment <error.message
+    // + stack>` here, but `observo run case set` (CLI v0.7.x) does not
+    // declare a --comment flag — every failing test emitted
+    // `unknown flag: --comment` and the case row landed without body.
+    // The failure context survives via (a) the per-step --comment we
+    // pass below (CLI's `run case step set` DOES accept --comment),
+    // and (b) the orchestrator workflow's failure-summary.md
+    // attachment (rendered from playwright-report/results.json).
+    // Re-introduce a case-level body field if/when the CLI grows a
+    // body / description / comment flag on `run case set`.
     const caseArgs = [
       "run",
       "case",
@@ -300,7 +379,6 @@ class ObservoReporter implements Reporter {
       "--status",
       status,
     ];
-    if (comment) caseArgs.push("--comment", comment);
     this.fireAndForget(caseArgs);
 
     // 2. Top-level test.step PATCHes (1-based).
@@ -347,13 +425,21 @@ class ObservoReporter implements Reporter {
           }
           continue;
         }
+        // OB-373 finding #1: previously included `--code <CODE>` here,
+        // but `observo run attach` (CLI v0.7.x) only accepts
+        // --project / --run-id / --file — attachments are run-scoped,
+        // not case-scoped — and every failing test logged
+        // `unknown flag: --code`, dropping the upload entirely. The
+        // file is now attached at the run level; spec/case context
+        // typically survives in Playwright's attachment path
+        // (test-results/<spec>/<test>/<artifact>). Re-introduce case
+        // linkage when the CLI grows a --code / --case flag on
+        // `run attach`.
         const args = [
           "run",
           "attach",
           "--run-id",
           this.runKey,
-          "--code",
-          code,
           "--file",
           att.path,
         ];
@@ -364,6 +450,25 @@ class ObservoReporter implements Reporter {
 
   async onEnd(_result: FullResult): Promise<void> {
     if (!this.cfg) return;
+
+    // OB-373 finding #4: emit a `pipeline.layers[]` aggregate before
+    // returning, so `observo run finish --status auto` (called by the
+    // orchestrator OR by us below) can see a Playwright pass/fail
+    // outcome alongside the four backend layers (mcp-unit,
+    // mcp-contract, frontend-unit, server-integration). Without this
+    // entry, run-row auto-status rollup ignores e2e entirely and
+    // drifts toward `failed` even when per-case PATCHes are clean.
+    //
+    // Gated on the same activation as the rest of the reporter
+    // (this.cfg is set ↔ OBSERVO_API_KEY present). Awaited rather
+    // than fire-and-forget because the orchestrator's `run finish`
+    // step in the next CI job races us otherwise — a layer that
+    // lands after run finish is invisible to that finish call.
+    // Customer-direct mode (createdRun=true) calls run finish below
+    // on the same connection; awaiting first keeps that ordering
+    // intact too.
+    await this.emitPipelineLayer();
+
     if (!this.createdRun) {
       // CI orchestrator owns the run lifecycle; we don't close it.
       return;
@@ -379,6 +484,56 @@ class ObservoReporter implements Reporter {
       ]);
     } catch (err) {
       this.warn(`run finish failed: ${(err as Error).message}`);
+    }
+  }
+
+  private async emitPipelineLayer(): Promise<void> {
+    if (!this.cfg) return;
+    if (this.opts.pipelineLayer === false) return;
+
+    const overrides =
+      typeof this.opts.pipelineLayer === "object" && this.opts.pipelineLayer
+        ? this.opts.pipelineLayer
+        : {};
+    const layerId = overrides.layerId || "e2e";
+    const displayName = overrides.displayName || "E2E (Playwright)";
+    const framework = overrides.framework || "playwright";
+    const junitPath =
+      overrides.junitPath ||
+      (this.fullConfig ? findJunitOutput(this.fullConfig) : null);
+
+    if (!junitPath) {
+      // Playwright's `junit` reporter not configured → no XML on disk
+      // for the CLI to parse. Per-case writeback still works; only
+      // the layer-aggregate roll-up is missing. One-line warning so
+      // the user can add the reporter if they want auto-status to
+      // include e2e.
+      this.warn(
+        `pipeline-layer skipped: configure Playwright's 'junit' reporter with outputFile (or pass pipelineLayer.junitPath) to enable run-row auto-status rollup for e2e.`,
+      );
+      return;
+    }
+
+    try {
+      await this.runCli([
+        "run",
+        "pipeline-layer",
+        "set",
+        "--run-id",
+        this.runKey,
+        "--layer-id",
+        layerId,
+        "--display-name",
+        displayName,
+        "--framework",
+        framework,
+        "--junit",
+        junitPath,
+      ]);
+    } catch (err) {
+      // Non-fatal: per-case PATCHes already landed; missing layer
+      // only affects auto-status rollup. Warn and continue.
+      this.warn(`pipeline-layer set failed: ${(err as Error).message}`);
     }
   }
 
@@ -434,10 +589,32 @@ class ObservoReporter implements Reporter {
       this.warn(`spawn ${this.cfg?.cliPath} failed: ${err.message}`);
     });
     child.on("close", (code) => {
-      if (code !== 0) {
-        const tail = stderr.trim().split("\n").slice(-3).join(" | ");
-        this.warn(`CLI ${verbArgs.slice(0, 3).join(" ")} exit ${code}: ${tail}`);
+      if (code === 0) return;
+      // OB-373 finding #3: per-step `step number N not found` 404s
+      // when the spec emits more `test.step()` calls than the case
+      // has step rows. The over-count steps have nowhere to land —
+      // per-row 404s neither carry signal nor break writeback for
+      // the steps that DID land. Surface ONE info line per case and
+      // suppress the rest so CI logs stay readable.
+      if (
+        verbArgs[0] === "run" &&
+        verbArgs[1] === "case" &&
+        verbArgs[2] === "step" &&
+        verbArgs[3] === "set" &&
+        /step number \d+ not found/i.test(stderr)
+      ) {
+        const codeIdx = verbArgs.indexOf("--code");
+        const codeVal = codeIdx >= 0 ? verbArgs[codeIdx + 1] : "";
+        if (codeVal && !this.stepNotFoundWarnedFor.has(codeVal)) {
+          this.stepNotFoundWarnedFor.add(codeVal);
+          this.warn(
+            `${codeVal}: spec emits more test.step()s than the case has step rows — over-count steps skipped (this is fine).`,
+          );
+        }
+        return;
       }
+      const tail = stderr.trim().split("\n").slice(-3).join(" | ");
+      this.warn(`CLI ${verbArgs.slice(0, 3).join(" ")} exit ${code}: ${tail}`);
     });
   }
 
