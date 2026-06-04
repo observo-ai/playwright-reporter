@@ -549,21 +549,27 @@ class ObservoReporter implements Reporter {
           }
           continue;
         }
-        // OB-373 finding #1: previously included `--code <CODE>` here,
-        // but `observo run attach` (CLI v0.7.x) only accepts
-        // --project / --run-id / --file — attachments are run-scoped,
-        // not case-scoped — and every failing test logged
-        // `unknown flag: --code`, dropping the upload entirely. The
-        // file is now attached at the run level; spec/case context
-        // typically survives in Playwright's attachment path
-        // (test-results/<spec>/<test>/<artifact>). Re-introduce case
-        // linkage when the CLI grows a --code / --case flag on
-        // `run attach`.
+        // OB-436: route attachments to the case drawer, not the
+        // run-level strip. Earlier reporter versions stripped --code
+        // because CLI v0.7.x rejected it (OB-373); CLI v0.8.0 added a
+        // proper --case flag (`observo run attach --case OB-55 …`), so
+        // we route to the case whenever the @observo:CODE tag gave us
+        // one. Falls back to run-level only if extractShortCode()
+        // somehow returned empty (shouldn't happen — the early return
+        // at the top of onTestEnd already bails on missing code).
+        //
+        // Parametrized cases (observo-cells annotation) still resolve
+        // to the case as a whole here: CLI `run attach` doesn't yet
+        // accept --example-cells. Tracked in OB-437 — once that lands,
+        // pass cellsJson through alongside --case (same pattern the
+        // case-step PATCH already uses on lines 459 / 484 / 524).
         const args = [
           "run",
           "attach",
           "--run-id",
           this.runKey,
+          "--case",
+          code,
           "--file",
           att.path,
         ];
