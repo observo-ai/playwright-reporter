@@ -837,6 +837,65 @@ describe("OB-405 case-level write skips parametrized cases", () => {
     expect(JSON.parse(stepSet!.args[idx + 1])).toEqual({ browser: "chromium" });
   });
 
+  // Auto-review round 3 (MEDIUM): the synthesised step-1 write must collapse
+  // non-pass statuses (timedOut → "blocked", skipped → "skipped") to
+  // "failed" — the step endpoint per the existing per-step loop only ever
+  // receives "passed"/"failed". Sending "blocked"/"skipped" risks a 4xx that
+  // would leave the example row stuck at not_started.
+  it("parametrized + NO test.step() + timedOut: synth step status collapses to failed", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "firefox" }) },
+    ];
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-4"], annotations }) as any,
+      fakeResult({ status: "timedOut", steps: [] }),
+    );
+
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-4"),
+    );
+    expect(stepSet, "synth step-1 fires").toBeTruthy();
+    const sIdx = stepSet!.args.indexOf("--status");
+    expect(stepSet!.args[sIdx + 1]).toBe("failed");
+  });
+
+  it("parametrized + NO test.step() + skipped: synth step status collapses to failed", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "webkit" }) },
+    ];
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-5"], annotations }) as any,
+      fakeResult({ status: "skipped", steps: [] }),
+    );
+
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-5"),
+    );
+    expect(stepSet, "synth step-1 fires").toBeTruthy();
+    const sIdx = stepSet!.args.indexOf("--status");
+    expect(stepSet!.args[sIdx + 1]).toBe("failed");
+  });
+
   // Symmetric guard: classic case with NO test.step() calls keeps its
   // existing behavior — case-level write fires, no synthetic step-1.
   it("classic case with NO test.step() calls: case-level write only (no synthetic step)", async () => {

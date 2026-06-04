@@ -489,7 +489,19 @@ class ObservoReporter implements Reporter {
     // classic path's `run case set` covers a no-steps test. If the case
     // template has zero step rows the server returns "step number 1 not
     // found" and the existing OB-373 dedup'd warning surfaces it.
+    //
+    // Round 3 review: the step endpoint is constrained to "passed"/"failed"
+    // by the per-step loop above (line 462 — Playwright `test.step()` errors
+    // only yield those two). The case-level endpoint accepts the full
+    // {passed, failed, blocked, skipped} set; sending the full mapStatus
+    // output here would mirror that asymmetry. Collapse non-pass → "failed"
+    // to match the step-endpoint contract — a timedOut/blocked test surfaces
+    // as failure (which is what the user wants to see), and a skipped test
+    // also surfaces as failure with the cells in the row (less precise than
+    // a true skip, but the alternative is leaving the row stuck at
+    // not_started which reads as a silent reporter drop).
     if (exampleCellsArg && steps.length === 0) {
+      const synthStatus = status === "passed" ? "passed" : "failed";
       const args = [
         "run",
         "case",
@@ -502,7 +514,7 @@ class ObservoReporter implements Reporter {
         "--step",
         "1",
         "--status",
-        status,
+        synthStatus,
         "--example-cells",
         exampleCellsArg,
       ];
