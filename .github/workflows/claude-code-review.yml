@@ -1,0 +1,83 @@
+name: Claude Code Review
+
+# Runs an auto-review on every PR push. Was previously plugin-based
+# (`plugins: code-review@claude-code-plugins` + `/code-review:code-review`
+# slash command), but that plugin is fetched fresh from anthropics/claude-code.git
+# on every run with no SHA pin. An upstream regression around 2026-05-23 21:10 UTC
+# silently broke the plugin's inline-comment posting — workflow exited 0 with
+# `permission_denials_count: 20` and `No buffered inline comments` while still
+# burning ~$3 per PR. Inlining the prompt eliminates that dependency.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+
+jobs:
+  claude-review:
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor'
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Write needed so `gh pr comment` from inside the Claude SDK can
+      # post the review back to this PR. The plugin-based config did
+      # this implicitly via a separate post-buffered-inline-comments step.
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # depth=0 so `git diff origin/main...HEAD` resolves; the inline
+          # prompt below diffs against the PR base to scope the review.
+          fetch-depth: 0
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        env:
+          # `gh` reads this automatically. The workflow's contents:read +
+          # pull-requests:write are enough; no PAT required for posting
+          # comments on the same repo.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Allowlist the tools the inline prompt actually needs. Without
+          # `Bash(gh *)` the action sandbox blocks the final `gh pr comment`
+          # call (this was the silent-fail mode on the plugin path too).
+          claude_args: '--allowed-tools "Bash(gh *),Bash(git diff*),Bash(git log*),Read,Grep,Glob"'
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }} ("${{ github.event.pull_request.title }}") in this repository.
+
+            Process:
+            1. Run `git fetch origin ${{ github.event.pull_request.base.ref }}` then `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD` to scope changes.
+            2. For each changed Go file, read the surrounding context and look for correctness bugs only: inverted/wrong conditions, off-by-one, null/undefined deref, missing error-return propagation, retry-on-non-retryable, swallowed errors, concurrency races, broken invariants the diff failed to re-establish, CLI flag wiring bugs (declared but not read), and API-contract drift (wire shape ≠ server proto / endpoint guesses that may 404). Pay extra attention to: HTTP client retry semantics, multipart vs JSON content-type for the attachments endpoint, short-code-vs-UUID validation on case/run paths, supply-chain risks in npm/scripts/install.js and docs/install (checksum verification).
+            3. Ignore style nits, alternative implementations, missing comments, naming preferences, "could also do X" suggestions. Only real bugs.
+            4. Cap findings at 8. Rank by severity (highest first).
+            5. If there are no real bugs, post a single short comment saying "No correctness issues found in this diff." — do NOT pad with positive feedback.
+
+            Post the review as ONE markdown comment via:
+              gh pr comment ${{ github.event.pull_request.number }} --body "<markdown>"
+
+            Use this exact comment shape:
+              ## Automated review
+
+              ### N. (SEVERITY) one-sentence summary
+              `file:line` — concrete failure scenario (inputs/state → wrong behavior).
+              Suggested fix (1-2 sentences).
+
+              ---
+              <repeat per finding>
+
+            Severity tags: CRITICAL / HIGH / MEDIUM / LOW / NIT. Use them honestly — most PRs have at most one MEDIUM, the rest LOW/NIT.
