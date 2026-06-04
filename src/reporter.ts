@@ -481,6 +481,34 @@ class ObservoReporter implements Reporter {
       this.fireAndForget(args);
     }
 
+    // OB-405 follow-up: parametrized case with ZERO test.step() calls.
+    // The case-level skip above would leave the example row at its initial
+    // not_started state forever — the rollup has nothing to roll up. Emit
+    // an overall-status write against step 1 of the targeted example so
+    // the example row picks up the run's outcome, analogous to how the
+    // classic path's `run case set` covers a no-steps test. If the case
+    // template has zero step rows the server returns "step number 1 not
+    // found" and the existing OB-373 dedup'd warning surfaces it.
+    if (exampleCellsArg && steps.length === 0) {
+      const args = [
+        "run",
+        "case",
+        "step",
+        "set",
+        "--run-id",
+        this.runKey,
+        "--code",
+        code,
+        "--step",
+        "1",
+        "--status",
+        status,
+        "--example-cells",
+        exampleCellsArg,
+      ];
+      this.fireAndForget(args);
+    }
+
     // 3. Attachments — only on failed/blocked unless uploadPassed.
     //    Storage bounded on a green run; debug-relevant attachments
     //    survive the gate.
@@ -677,10 +705,18 @@ class ObservoReporter implements Reporter {
       ) {
         const codeIdx = verbArgs.indexOf("--code");
         const codeVal = codeIdx >= 0 ? verbArgs[codeIdx + 1] : "";
-        if (codeVal && !this.stepNotFoundWarnedFor.has(codeVal)) {
-          this.stepNotFoundWarnedFor.add(codeVal);
+        // OB-405 follow-up: include --example-cells in the dedup key so each
+        // parametrized example's over-count warning surfaces independently;
+        // before this the second example was silently suppressed because the
+        // first one already added the bare code to the set.
+        const cellsIdx = verbArgs.indexOf("--example-cells");
+        const cellsVal = cellsIdx >= 0 ? verbArgs[cellsIdx + 1] : "";
+        const dedupKey = cellsVal ? `${codeVal}:${cellsVal}` : codeVal;
+        if (codeVal && !this.stepNotFoundWarnedFor.has(dedupKey)) {
+          this.stepNotFoundWarnedFor.add(dedupKey);
+          const exampleSuffix = cellsVal ? ` (example ${cellsVal})` : "";
           this.warn(
-            `${codeVal}: spec emits more test.step()s than the case has step rows — over-count steps skipped (this is fine).`,
+            `${codeVal}${exampleSuffix}: spec emits more test.step()s than the case has step rows — over-count steps skipped (this is fine).`,
           );
         }
         return;
