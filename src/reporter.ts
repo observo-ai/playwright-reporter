@@ -155,6 +155,65 @@ function resolveConfig(opts: ReporterOptions): ResolvedConfig | null {
   };
 }
 
+/**
+ * OB-405: per-example parameter values for a parametrized test, conveyed via
+ * a Playwright TestCase annotation: `{ type: "observo-cells", description: <JSON> }`.
+ * The reporter forwards these to the CLI as `--example-cells '<json>'`, which
+ * the server then matches against `test_run_cases.param_values` (OB-423) to
+ * route the per-step write to the correct example. Use the `observoCells()`
+ * helper exported from the package root to construct the annotation in test
+ * code without typing the type string and JSON yourself.
+ *
+ * If multiple `observo-cells` annotations are present, the LAST one wins —
+ * matches the natural override pattern of late `test.info().annotations.push(...)`.
+ * If the description is missing or not a flat JSON object of string values, it
+ * is silently skipped (the per-step write then falls through to the
+ * row-number / classic path on the server, and the reporter logs once).
+ */
+const OBSERVO_CELLS_TYPE = "observo-cells";
+
+export function extractExampleCells(
+  test: TestCase,
+  warn: (msg: string) => void,
+): Record<string, string> | null {
+  let chosen: { type: string; description?: string } | null = null;
+  // `?? []` — defensive against mocks/edge cases where annotations is unset.
+  // Real Playwright always supplies an array per the TestCase API.
+  for (const a of test.annotations ?? []) {
+    if (a.type === OBSERVO_CELLS_TYPE) chosen = a;
+  }
+  if (!chosen) return null;
+  const desc = (chosen.description ?? "").trim();
+  if (!desc) {
+    warn(`${test.title}: observo-cells annotation has no description, skipped`);
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(desc);
+  } catch (e) {
+    warn(`${test.title}: observo-cells JSON parse failed: ${(e as Error).message}`);
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    warn(`${test.title}: observo-cells must be a flat JSON object, skipped`);
+    return null;
+  }
+  const cells: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v !== "string") {
+      warn(`${test.title}: observo-cells value for ${k} is not a string, skipped`);
+      return null;
+    }
+    cells[k] = v;
+  }
+  if (Object.keys(cells).length === 0) {
+    warn(`${test.title}: observo-cells is empty, skipped`);
+    return null;
+  }
+  return cells;
+}
+
 function extractShortCode(test: TestCase): string | null {
   // 1. Explicit @observo:CODE-N tag — authoritative.
   for (const tag of test.tags) {
@@ -388,6 +447,12 @@ class ObservoReporter implements Reporter {
         `${code}: nested test.step() detected — only top-level steps PATCH; nested ones stay at queued. Flatten in test code to surface them.`,
       );
     }
+    // OB-405: per-example targeting for parametrized cases. Compute once per
+    // test (annotations don't change between steps of the same invocation).
+    // null = classic / non-parametrized → omit the flag, server falls through
+    // to its single-run-case path.
+    const exampleCells = extractExampleCells(test, (m) => this.warn(m));
+    const exampleCellsArg = exampleCells ? JSON.stringify(exampleCells) : null;
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       const stepStatus = step.error ? "failed" : "passed";
@@ -406,6 +471,7 @@ class ObservoReporter implements Reporter {
         stepStatus,
       ];
       if (step.error?.message) args.push("--comment", step.error.message);
+      if (exampleCellsArg) args.push("--example-cells", exampleCellsArg);
       this.fireAndForget(args);
     }
 
