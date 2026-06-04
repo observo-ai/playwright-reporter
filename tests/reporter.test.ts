@@ -567,8 +567,14 @@ describe("OB-373: run case set does not pass unknown --comment flag", () => {
   });
 });
 
-describe("OB-373: run attach is run-scoped (no --code)", () => {
-  it("does NOT pass --code on attach (CLI v0.7.x rejects it)", async () => {
+describe("OB-436: run attach routes to case (not run-level)", () => {
+  // History: OB-373 originally stripped --code because CLI v0.7.x
+  // rejected it, so attachments fell to the run-level strip. CLI
+  // v0.8.0 added a proper --case flag, so the workaround is now
+  // stale — case-drawer attachments are the headline Wave-3 UX
+  // promise. The pre-OB-436 invariant ("attach does NOT contain
+  // --code") is intentionally inverted here.
+  it("passes --case <code> AND --file on every attach call", async () => {
     process.env.OBSERVO_API_KEY = "k";
     process.env.OBSERVO_RUN_KEY = "RUN-99";
     const r = new ObservoReporter();
@@ -578,16 +584,29 @@ describe("OB-373: run attach is run-scoped (no --code)", () => {
       fakeTest({ tags: ["@observo:WEB-7"] }),
       fakeResult({
         status: "failed",
-        attachments: [{ name: "trace", path: "/tmp/trace.zip" }],
+        attachments: [
+          { name: "trace", path: "/tmp/trace.zip" },
+          { name: "screenshot", path: "/tmp/shot.png" },
+        ],
       }),
     );
-    const attach = spawnCalls.find((c) => c.args.includes("attach"));
-    expect(attach).toBeTruthy();
-    expect(attach!.args).not.toContain("--code");
-    expect(attach!.args).toContain("--file");
-    expect(attach!.args).toContain("/tmp/trace.zip");
-    expect(attach!.args).toContain("--run-id");
-    expect(attach!.args).toContain("RUN-99");
+    const attaches = spawnCalls.filter((c) => c.args.includes("attach"));
+    expect(attaches.length).toBe(2);
+    for (const attach of attaches) {
+      // OB-436: --case + value must be adjacent so the CLI gets the
+      // pair, not just an orphan flag.
+      const idx = attach.args.indexOf("--case");
+      expect(idx, "attach call missing --case flag").toBeGreaterThanOrEqual(0);
+      expect(attach.args[idx + 1]).toBe("WEB-7");
+      // Run-id still present (case + run-id together resolve the
+      // run-case row server-side).
+      expect(attach.args).toContain("--run-id");
+      expect(attach.args).toContain("RUN-99");
+      expect(attach.args).toContain("--file");
+    }
+    // Both files routed to the same case (WEB-7), distinct --file values.
+    const files = attaches.map((c) => c.args[c.args.indexOf("--file") + 1]).sort();
+    expect(files).toEqual(["/tmp/shot.png", "/tmp/trace.zip"]);
   });
 });
 
