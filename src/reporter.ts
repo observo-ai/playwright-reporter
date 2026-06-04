@@ -415,30 +415,42 @@ class ObservoReporter implements Reporter {
 
     const status = mapStatus(result.status);
 
-    // 1. Case status.
+    // OB-405: per-example targeting for parametrized cases. Compute once per
+    // test (annotations don't change between steps of the same invocation).
+    // null = classic / non-parametrized → omit the flag, server falls through
+    // to its single-run-case path.
+    const exampleCells = extractExampleCells(test, (m) => this.warn(m));
+    const exampleCellsArg = exampleCells ? JSON.stringify(exampleCells) : null;
+
+    // 1. Case status — ONLY for classic (non-parametrized) cases.
     //
-    // OB-373 finding #2: previously appended `--comment <error.message
-    // + stack>` here, but `observo run case set` (CLI v0.7.x) does not
-    // declare a --comment flag — every failing test emitted
-    // `unknown flag: --comment` and the case row landed without body.
-    // The failure context survives via (a) the per-step --comment we
-    // pass below (CLI's `run case step set` DOES accept --comment),
-    // and (b) the orchestrator workflow's failure-summary.md
-    // attachment (rendered from playwright-report/results.json).
-    // Re-introduce a case-level body field if/when the CLI grows a
-    // body / description / comment flag on `run case set`.
-    const caseArgs = [
-      "run",
-      "case",
-      "set",
-      "--run-id",
-      this.runKey,
-      "--code",
-      code,
-      "--status",
-      status,
-    ];
-    this.fireAndForget(caseArgs);
+    // For parametrized cases (exampleCells present): OB-401 derives the parent
+    // case status by rolling up the per-example rows. The per-step writes below
+    // carry --example-cells and land on the correct example row; the parent
+    // badge is computed from those by the server. Issuing `run case set`
+    // here would either no-op or — worse — silently target the first example
+    // row via ambiguous match (case-level path doesn't see --example-cells:
+    // observo-cli v0.8.x exposes the flag only on `run case step set`,
+    // precedent: OB-373 finding #2 removed --comment for the same reason).
+    //
+    // OB-373 finding #2 historical note: previously appended `--comment` here
+    // but CLI v0.7.x did not declare it; the failure context survives via the
+    // per-step --comment we pass below + the orchestrator workflow's
+    // failure-summary.md attachment.
+    if (!exampleCells) {
+      const caseArgs = [
+        "run",
+        "case",
+        "set",
+        "--run-id",
+        this.runKey,
+        "--code",
+        code,
+        "--status",
+        status,
+      ];
+      this.fireAndForget(caseArgs);
+    }
 
     // 2. Top-level test.step PATCHes (1-based).
     const steps = userSteps(result.steps);
@@ -447,12 +459,6 @@ class ObservoReporter implements Reporter {
         `${code}: nested test.step() detected — only top-level steps PATCH; nested ones stay at queued. Flatten in test code to surface them.`,
       );
     }
-    // OB-405: per-example targeting for parametrized cases. Compute once per
-    // test (annotations don't change between steps of the same invocation).
-    // null = classic / non-parametrized → omit the flag, server falls through
-    // to its single-run-case path.
-    const exampleCells = extractExampleCells(test, (m) => this.warn(m));
-    const exampleCellsArg = exampleCells ? JSON.stringify(exampleCells) : null;
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       const stepStatus = step.error ? "failed" : "passed";

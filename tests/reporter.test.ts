@@ -70,11 +70,13 @@ function fakeTest(opts: {
   tags?: string[];
   retries?: number;
   parentTitle?: string;
+  annotations?: { type: string; description?: string }[];
 }): any {
   return {
     title: opts.title || "some test",
     tags: opts.tags || [],
     retries: opts.retries ?? 0,
+    annotations: opts.annotations ?? [],
     parent: opts.parentTitle ? { title: opts.parentTitle, parent: undefined } : undefined,
   };
 }
@@ -717,5 +719,76 @@ describe("OB-373: pipeline-layer aggregate in onEnd", () => {
         (c) => c.args.includes("pipeline-layer") && c.args.includes("set"),
       ),
     ).toBe(false);
+  });
+});
+
+// OB-405: case-level write must SKIP parametrized cases. The CLI's
+// `run case set` has no --example-cells flag (v0.8.x exposes the flag only on
+// `run case step set`), and per OB-401 the parent case status is derived from
+// the per-example rollup anyway. Issuing a case-level write here would either
+// no-op or silently target the first example row by ambiguous match — the
+// auto-review on PR #5 caught this. Precedent: OB-373 finding #2 removed
+// --comment from case-level writes for the same reason.
+describe("OB-405 case-level write skips parametrized cases", () => {
+  it("classic case (no observo-cells annotation): emits `run case set`", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:CLASSIC-1"] }) as any,
+      fakeResult({ status: "passed" }),
+    );
+
+    const caseSet = spawnCalls.find(
+      (c) => c.args.includes("case") && c.args.includes("set") && c.args.includes("CLASSIC-1"),
+    );
+    expect(caseSet, "classic case must emit `run case set`").toBeTruthy();
+  });
+
+  it("parametrized case (observo-cells annotation present): skips `run case set`", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "firefox" }) },
+    ];
+    // Provide at least one step so the step-level path fires too — proves it
+    // continues to carry --example-cells while the case-level path skips.
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-1"], annotations }) as any,
+      fakeResult({
+        status: "passed",
+        steps: [{ category: "test.step", title: "s1", steps: [] }],
+      }),
+    );
+
+    // Case-level write must be ABSENT for the parametrized case.
+    const caseSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("set") &&
+        !c.args.includes("step") &&
+        c.args.includes("PARAM-1"),
+    );
+    expect(caseSet, "parametrized case must NOT emit `run case set`").toBeFalsy();
+
+    // Step-level write must still fire, with --example-cells carrying the cells.
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-1"),
+    );
+    expect(stepSet, "step-level write still fires").toBeTruthy();
+    expect(stepSet!.args).toContain("--example-cells");
+    const idx = stepSet!.args.indexOf("--example-cells");
+    expect(JSON.parse(stepSet!.args[idx + 1])).toEqual({ browser: "firefox" });
   });
 });
