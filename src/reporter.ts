@@ -320,6 +320,18 @@ class ObservoReporter implements Reporter {
   // adding signal. We surface ONE info-level line per case and stay
   // silent for subsequent occurrences within the same test run.
   private stepNotFoundWarnedFor: Set<string> = new Set();
+  // OB-434: every fire-and-forget child registers a promise that resolves
+  // when the child closes (success or failure). onEnd awaits this list
+  // before returning so the parent process doesn't exit mid-upload and
+  // SIGTERM the children — which silently drops trace.zip / video /
+  // screenshot attachments for failing cases (the very artifacts the
+  // dashboard most needs).
+  private pendingChildren: Promise<void>[] = [];
+  // Hard cap on how long onEnd waits for in-flight uploads to drain.
+  // Belt-and-braces so a wedged S3 PUT can't hang the CI job — the CLI
+  // already retries 5xx/429/408 internally, so 60s comfortably covers
+  // a typical trace.zip stream + retry budget.
+  private static readonly DRAIN_DEADLINE_MS = 60_000;
 
   constructor(opts: ReporterOptions = {}) {
     this.opts = opts;
@@ -563,6 +575,33 @@ class ObservoReporter implements Reporter {
   async onEnd(_result: FullResult): Promise<void> {
     if (!this.cfg) return;
 
+    // OB-434: drain in-flight fire-and-forget uploads before yielding
+    // back to Playwright. Without this, the process exits as soon as
+    // onEnd resolves and Node sends SIGTERM to every still-running
+    // child — case-status PATCHes (~200 B) usually beat the signal,
+    // but trace.zip / video / screenshot uploads (1–3 MB streamed to
+    // presigned S3) lose the race and never reach the dashboard.
+    // Snapshot the pool first: late additions from concurrent test
+    // teardown would otherwise extend the wait indefinitely.
+    const drainPool = this.pendingChildren.slice();
+    if (drainPool.length > 0) {
+      const settled = Promise.allSettled(drainPool);
+      const timeoutHandle: { v?: NodeJS.Timeout } = {};
+      const deadline = new Promise<"timeout">((resolve) => {
+        timeoutHandle.v = setTimeout(
+          () => resolve("timeout"),
+          ObservoReporter.DRAIN_DEADLINE_MS,
+        );
+      });
+      const outcome = await Promise.race([settled.then(() => "done" as const), deadline]);
+      if (timeoutHandle.v) clearTimeout(timeoutHandle.v);
+      if (outcome === "timeout") {
+        this.warn(
+          `drain timeout (${Math.round(ObservoReporter.DRAIN_DEADLINE_MS / 1000)}s) — ${drainPool.length} CLI children still in-flight; uploads may be incomplete.`,
+        );
+      }
+    }
+
     // OB-373 finding #4: emit a `pipeline.layers[]` aggregate before
     // returning, so `observo run finish --status auto` (called by the
     // orchestrator OR by us below) can see a Playwright pass/fail
@@ -696,11 +735,21 @@ class ObservoReporter implements Reporter {
     child.stderr.on("data", (d) => {
       stderr += String(d);
     });
+    // OB-434: register a settle-on-close promise so onEnd can drain the
+    // pool before returning. Use 'close' (final FD release), not 'exit'
+    // (process ended but stdio may still be flushing). 'error' also
+    // resolves — Node fires 'error' but NOT 'close' on spawn failure
+    // (e.g. ENOENT before the process is forked), so without this both
+    // listeners the promise would hang forever.
+    let settle: () => void;
+    this.pendingChildren.push(new Promise<void>((r) => (settle = r)));
     child.on("error", (err) => {
       // ENOENT typically — `observo` not on PATH.
       this.warn(`spawn ${this.cfg?.cliPath} failed: ${err.message}`);
+      settle();
     });
     child.on("close", (code) => {
+      settle();
       if (code === 0) return;
       // OB-373 finding #3: per-step `step number N not found` 404s
       // when the spec emits more `test.step()` calls than the case

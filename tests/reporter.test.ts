@@ -15,6 +15,14 @@ type SpawnOverride = {
   stdout?: string;
   stderr?: string;
   exitCode?: number;
+  // OB-434: delay the close emit by N ms so a test can assert onEnd
+  // genuinely awaits in-flight uploads. Default (undefined) keeps the
+  // legacy immediate-close behaviour every other test relies on.
+  closeDelayMs?: number;
+  // OB-434: skip the close emit entirely — the child stays alive until
+  // the test instructs it otherwise via the returned handle. Used to
+  // exercise the drain-deadline timeout path.
+  neverClose?: boolean;
 };
 let spawnBehavior: (args: string[]) => SpawnOverride | null = () => null;
 
@@ -44,7 +52,13 @@ vi.mock("node:child_process", () => {
           }
         }
         if (override?.stderr) ee.stderr.emit("data", override.stderr);
-        ee.emit("close", override?.exitCode ?? 0);
+        if (override?.neverClose) return;
+        const close = () => ee.emit("close", override?.exitCode ?? 0);
+        if (override?.closeDelayMs && override.closeDelayMs > 0) {
+          setTimeout(close, override.closeDelayMs);
+        } else {
+          close();
+        }
       });
       return ee;
     },
@@ -988,5 +1002,60 @@ describe("OB-405 case-level write skips parametrized cases", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe("OB-434: onEnd drains in-flight fire-and-forget uploads", () => {
+  // Regression for the silent-attachment-drop bug. Pre-OB-434, onEnd
+  // returned immediately when `createdRun` is false (orchestrator-owned
+  // run lifecycle — i.e. the production CI mode). The parent Node
+  // process then exited and SIGTERM'd every still-running attach
+  // child; case status PATCHes (~200 B) usually won the race but
+  // trace.zip / video / screenshot uploads (1–3 MB streamed to
+  // presigned S3) lost it, so failing cases landed on the dashboard
+  // without their debug artifacts. Concrete miss observed on
+  // run_2026060495 (PR #396, OB-55 broken deliberately): case
+  // recorded as `failed` with step-7 error comment, ZERO attachments.
+  it("onEnd does not resolve until all fire-and-forget children close", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_PROJECT_CODE = "OB";
+    process.env.OBSERVO_RUN_KEY = "RUN-99"; // orchestrator-owned → createdRun=false
+
+    // Hold every fire-and-forget child open for 80 ms so we can observe
+    // that onEnd genuinely waits. The synchronous `run create` /
+    // `run finish` paths (via runCli, not fireAndForget) close
+    // immediately so the run-lifecycle calls aren't slowed.
+    spawnBehavior = (args) => {
+      const verb = `${args.includes("case") ? "case" : args.includes("attach") ? "attach" : ""}`;
+      if (verb === "case" || verb === "attach") return { closeDelayMs: 80 };
+      return null;
+    };
+
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    // Drive ONE failed test with 2 attachments — fires `run case set`
+    // + `run attach × 2` via fireAndForget, total 3 pending children.
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        attachments: [
+          { name: "screenshot", path: "/tmp/screenshot.png", contentType: "image/png" },
+          { name: "trace", path: "/tmp/trace.zip", contentType: "application/zip" },
+        ],
+      }),
+    );
+
+    const t0 = Date.now();
+    await r.onEnd({} as any);
+    const elapsed = Date.now() - t0;
+
+    // onEnd must have waited at least one closeDelayMs window — proves
+    // the new drain logic actually awaited the pool. Allow a small
+    // floor margin (60 ms) for timer jitter on slow CI.
+    expect(
+      elapsed,
+      `expected onEnd to await pending children (>=60ms), got ${elapsed}ms`,
+    ).toBeGreaterThanOrEqual(60);
   });
 });
