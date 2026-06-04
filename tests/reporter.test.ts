@@ -70,11 +70,13 @@ function fakeTest(opts: {
   tags?: string[];
   retries?: number;
   parentTitle?: string;
+  annotations?: { type: string; description?: string }[];
 }): any {
   return {
     title: opts.title || "some test",
     tags: opts.tags || [],
     retries: opts.retries ?? 0,
+    annotations: opts.annotations ?? [],
     parent: opts.parentTitle ? { title: opts.parentTitle, parent: undefined } : undefined,
   };
 }
@@ -717,5 +719,274 @@ describe("OB-373: pipeline-layer aggregate in onEnd", () => {
         (c) => c.args.includes("pipeline-layer") && c.args.includes("set"),
       ),
     ).toBe(false);
+  });
+});
+
+// OB-405: case-level write must SKIP parametrized cases. The CLI's
+// `run case set` has no --example-cells flag (v0.8.x exposes the flag only on
+// `run case step set`), and per OB-401 the parent case status is derived from
+// the per-example rollup anyway. Issuing a case-level write here would either
+// no-op or silently target the first example row by ambiguous match — the
+// auto-review on PR #5 caught this. Precedent: OB-373 finding #2 removed
+// --comment from case-level writes for the same reason.
+describe("OB-405 case-level write skips parametrized cases", () => {
+  it("classic case (no observo-cells annotation): emits `run case set`", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:CLASSIC-1"] }) as any,
+      fakeResult({ status: "passed" }),
+    );
+
+    const caseSet = spawnCalls.find(
+      (c) => c.args.includes("case") && c.args.includes("set") && c.args.includes("CLASSIC-1"),
+    );
+    expect(caseSet, "classic case must emit `run case set`").toBeTruthy();
+  });
+
+  it("parametrized case (observo-cells annotation present): skips `run case set`", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "firefox" }) },
+    ];
+    // Provide at least one step so the step-level path fires too — proves it
+    // continues to carry --example-cells while the case-level path skips.
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-1"], annotations }) as any,
+      fakeResult({
+        status: "passed",
+        steps: [{ category: "test.step", title: "s1", steps: [] }],
+      }),
+    );
+
+    // Case-level write must be ABSENT for the parametrized case.
+    const caseSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("set") &&
+        !c.args.includes("step") &&
+        c.args.includes("PARAM-1"),
+    );
+    expect(caseSet, "parametrized case must NOT emit `run case set`").toBeFalsy();
+
+    // Step-level write must still fire, with --example-cells carrying the cells.
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-1"),
+    );
+    expect(stepSet, "step-level write still fires").toBeTruthy();
+    expect(stepSet!.args).toContain("--example-cells");
+    const idx = stepSet!.args.indexOf("--example-cells");
+    expect(JSON.parse(stepSet!.args[idx + 1])).toEqual({ browser: "firefox" });
+  });
+
+  // Auto-review round 2, finding 1 (HIGH): parametrized + zero test.step()
+  // calls would emit no writes at all post-case-skip — example row would stay
+  // not_started silently. Synthesize a step-1 write so the example picks up
+  // the overall status.
+  it("parametrized case with NO test.step() calls: synthesizes a step-1 write with cells", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "chromium" }) },
+    ];
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-2"], annotations }) as any,
+      fakeResult({ status: "passed", steps: [] }),
+    );
+
+    const caseSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("set") &&
+        !c.args.includes("step") &&
+        c.args.includes("PARAM-2"),
+    );
+    expect(caseSet, "no case-level write for parametrized").toBeFalsy();
+
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-2"),
+    );
+    expect(stepSet, "synthetic step-1 write fires").toBeTruthy();
+    expect(stepSet!.args).toContain("--step");
+    expect(stepSet!.args[stepSet!.args.indexOf("--step") + 1]).toBe("1");
+    expect(stepSet!.args).toContain("--status");
+    expect(stepSet!.args[stepSet!.args.indexOf("--status") + 1]).toBe("passed");
+    expect(stepSet!.args).toContain("--example-cells");
+    const idx = stepSet!.args.indexOf("--example-cells");
+    expect(JSON.parse(stepSet!.args[idx + 1])).toEqual({ browser: "chromium" });
+  });
+
+  // Auto-review round 3 (MEDIUM): the synthesised step-1 write must collapse
+  // non-pass statuses (timedOut → "blocked", skipped → "skipped") to
+  // "failed" — the step endpoint per the existing per-step loop only ever
+  // receives "passed"/"failed". Sending "blocked"/"skipped" risks a 4xx that
+  // would leave the example row stuck at not_started.
+  it("parametrized + NO test.step() + timedOut: synth step status collapses to failed", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "firefox" }) },
+    ];
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-4"], annotations }) as any,
+      fakeResult({ status: "timedOut", steps: [] }),
+    );
+
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-4"),
+    );
+    expect(stepSet, "synth step-1 fires").toBeTruthy();
+    const sIdx = stepSet!.args.indexOf("--status");
+    expect(stepSet!.args[sIdx + 1]).toBe("failed");
+  });
+
+  it("parametrized + NO test.step() + skipped: synth step status collapses to failed", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    const annotations = [
+      { type: "observo-cells", description: JSON.stringify({ browser: "webkit" }) },
+    ];
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:PARAM-5"], annotations }) as any,
+      fakeResult({ status: "skipped", steps: [] }),
+    );
+
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("PARAM-5"),
+    );
+    expect(stepSet, "synth step-1 fires").toBeTruthy();
+    const sIdx = stepSet!.args.indexOf("--status");
+    expect(stepSet!.args[sIdx + 1]).toBe("failed");
+  });
+
+  // Symmetric guard: classic case with NO test.step() calls keeps its
+  // existing behavior — case-level write fires, no synthetic step-1.
+  it("classic case with NO test.step() calls: case-level write only (no synthetic step)", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:CLASSIC-2"] }) as any,
+      fakeResult({ status: "passed", steps: [] }),
+    );
+
+    const caseSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("set") &&
+        !c.args.includes("step") &&
+        c.args.includes("CLASSIC-2"),
+    );
+    expect(caseSet, "classic case-level write fires").toBeTruthy();
+    const stepSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes("CLASSIC-2"),
+    );
+    expect(stepSet, "no synthetic step write for classic").toBeFalsy();
+  });
+
+  // Auto-review round 2, finding 2 (LOW): "step number N not found" dedup
+  // was keyed by case code alone, suppressing the warning for the 2nd example
+  // of the same parametrized case. Each distinct example must emit its own
+  // warning.
+  it("over-count step warning dedups per (code, example-cells) — not per code alone", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-1";
+
+    // Force the spawned CLI to exit non-zero with the "step number N not found"
+    // stderr for `run case step set` calls — same shape the server returns
+    // when over-counting steps.
+    // Reporter prepends `--api-key <k>` to every spawn — match on the
+    // `case … step … set` triple inside the slice instead of by index 0.
+    spawnBehavior = (args) => {
+      if (
+        args.includes("step") &&
+        args.includes("set") &&
+        args[args.indexOf("step") - 1] === "case"
+      ) {
+        return { exitCode: 1, stderr: "step number 1 not found" };
+      }
+      return null;
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const r = new ObservoReporter();
+      await r.onBegin({} as any, {} as any);
+      spawnCalls.length = 0;
+      warnSpy.mockClear();
+
+      // Two examples of the same case PARAM-3 — chromium and firefox.
+      const mkAnno = (browser: string) => [
+        { type: "observo-cells", description: JSON.stringify({ browser }) },
+      ];
+      for (const browser of ["chromium", "firefox"]) {
+        await r.onTestEnd(
+          fakeTest({ tags: ["@observo:PARAM-3"], annotations: mkAnno(browser) }) as any,
+          fakeResult({
+            status: "passed",
+            steps: [{ title: "s", category: "test.step", steps: [] }],
+          }),
+        );
+      }
+      // Let the close handlers (queued via setImmediate by the spawn mock)
+      // drain before asserting on console.warn.
+      await flushAsync();
+
+      const overCountWarnings = warnSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((m) => m.includes("more test.step()s"));
+      expect(
+        overCountWarnings.length,
+        `expected 2 distinct over-count warnings (one per example), got ${overCountWarnings.length}: ${JSON.stringify(overCountWarnings)}`,
+      ).toBe(2);
+      expect(overCountWarnings.some((m) => m.includes("chromium"))).toBe(true);
+      expect(overCountWarnings.some((m) => m.includes("firefox"))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

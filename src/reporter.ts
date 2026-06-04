@@ -155,6 +155,65 @@ function resolveConfig(opts: ReporterOptions): ResolvedConfig | null {
   };
 }
 
+/**
+ * OB-405: per-example parameter values for a parametrized test, conveyed via
+ * a Playwright TestCase annotation: `{ type: "observo-cells", description: <JSON> }`.
+ * The reporter forwards these to the CLI as `--example-cells '<json>'`, which
+ * the server then matches against `test_run_cases.param_values` (OB-423) to
+ * route the per-step write to the correct example. Use the `observoCells()`
+ * helper exported from the package root to construct the annotation in test
+ * code without typing the type string and JSON yourself.
+ *
+ * If multiple `observo-cells` annotations are present, the LAST one wins —
+ * matches the natural override pattern of late `test.info().annotations.push(...)`.
+ * If the description is missing or not a flat JSON object of string values, it
+ * is silently skipped (the per-step write then falls through to the
+ * row-number / classic path on the server, and the reporter logs once).
+ */
+const OBSERVO_CELLS_TYPE = "observo-cells";
+
+export function extractExampleCells(
+  test: TestCase,
+  warn: (msg: string) => void,
+): Record<string, string> | null {
+  let chosen: { type: string; description?: string } | null = null;
+  // `?? []` — defensive against mocks/edge cases where annotations is unset.
+  // Real Playwright always supplies an array per the TestCase API.
+  for (const a of test.annotations ?? []) {
+    if (a.type === OBSERVO_CELLS_TYPE) chosen = a;
+  }
+  if (!chosen) return null;
+  const desc = (chosen.description ?? "").trim();
+  if (!desc) {
+    warn(`${test.title}: observo-cells annotation has no description, skipped`);
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(desc);
+  } catch (e) {
+    warn(`${test.title}: observo-cells JSON parse failed: ${(e as Error).message}`);
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    warn(`${test.title}: observo-cells must be a flat JSON object, skipped`);
+    return null;
+  }
+  const cells: Record<string, string> = {};
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v !== "string") {
+      warn(`${test.title}: observo-cells value for ${k} is not a string, skipped`);
+      return null;
+    }
+    cells[k] = v;
+  }
+  if (Object.keys(cells).length === 0) {
+    warn(`${test.title}: observo-cells is empty, skipped`);
+    return null;
+  }
+  return cells;
+}
+
 function extractShortCode(test: TestCase): string | null {
   // 1. Explicit @observo:CODE-N tag — authoritative.
   for (const tag of test.tags) {
@@ -356,30 +415,42 @@ class ObservoReporter implements Reporter {
 
     const status = mapStatus(result.status);
 
-    // 1. Case status.
+    // OB-405: per-example targeting for parametrized cases. Compute once per
+    // test (annotations don't change between steps of the same invocation).
+    // null = classic / non-parametrized → omit the flag, server falls through
+    // to its single-run-case path.
+    const exampleCells = extractExampleCells(test, (m) => this.warn(m));
+    const exampleCellsArg = exampleCells ? JSON.stringify(exampleCells) : null;
+
+    // 1. Case status — ONLY for classic (non-parametrized) cases.
     //
-    // OB-373 finding #2: previously appended `--comment <error.message
-    // + stack>` here, but `observo run case set` (CLI v0.7.x) does not
-    // declare a --comment flag — every failing test emitted
-    // `unknown flag: --comment` and the case row landed without body.
-    // The failure context survives via (a) the per-step --comment we
-    // pass below (CLI's `run case step set` DOES accept --comment),
-    // and (b) the orchestrator workflow's failure-summary.md
-    // attachment (rendered from playwright-report/results.json).
-    // Re-introduce a case-level body field if/when the CLI grows a
-    // body / description / comment flag on `run case set`.
-    const caseArgs = [
-      "run",
-      "case",
-      "set",
-      "--run-id",
-      this.runKey,
-      "--code",
-      code,
-      "--status",
-      status,
-    ];
-    this.fireAndForget(caseArgs);
+    // For parametrized cases (exampleCells present): OB-401 derives the parent
+    // case status by rolling up the per-example rows. The per-step writes below
+    // carry --example-cells and land on the correct example row; the parent
+    // badge is computed from those by the server. Issuing `run case set`
+    // here would either no-op or — worse — silently target the first example
+    // row via ambiguous match (case-level path doesn't see --example-cells:
+    // observo-cli v0.8.x exposes the flag only on `run case step set`,
+    // precedent: OB-373 finding #2 removed --comment for the same reason).
+    //
+    // OB-373 finding #2 historical note: previously appended `--comment` here
+    // but CLI v0.7.x did not declare it; the failure context survives via the
+    // per-step --comment we pass below + the orchestrator workflow's
+    // failure-summary.md attachment.
+    if (!exampleCells) {
+      const caseArgs = [
+        "run",
+        "case",
+        "set",
+        "--run-id",
+        this.runKey,
+        "--code",
+        code,
+        "--status",
+        status,
+      ];
+      this.fireAndForget(caseArgs);
+    }
 
     // 2. Top-level test.step PATCHes (1-based).
     const steps = userSteps(result.steps);
@@ -406,6 +477,47 @@ class ObservoReporter implements Reporter {
         stepStatus,
       ];
       if (step.error?.message) args.push("--comment", step.error.message);
+      if (exampleCellsArg) args.push("--example-cells", exampleCellsArg);
+      this.fireAndForget(args);
+    }
+
+    // OB-405 follow-up: parametrized case with ZERO test.step() calls.
+    // The case-level skip above would leave the example row at its initial
+    // not_started state forever — the rollup has nothing to roll up. Emit
+    // an overall-status write against step 1 of the targeted example so
+    // the example row picks up the run's outcome, analogous to how the
+    // classic path's `run case set` covers a no-steps test. If the case
+    // template has zero step rows the server returns "step number 1 not
+    // found" and the existing OB-373 dedup'd warning surfaces it.
+    //
+    // Round 3 review: the step endpoint is constrained to "passed"/"failed"
+    // by the per-step loop above (line 462 — Playwright `test.step()` errors
+    // only yield those two). The case-level endpoint accepts the full
+    // {passed, failed, blocked, skipped} set; sending the full mapStatus
+    // output here would mirror that asymmetry. Collapse non-pass → "failed"
+    // to match the step-endpoint contract — a timedOut/blocked test surfaces
+    // as failure (which is what the user wants to see), and a skipped test
+    // also surfaces as failure with the cells in the row (less precise than
+    // a true skip, but the alternative is leaving the row stuck at
+    // not_started which reads as a silent reporter drop).
+    if (exampleCellsArg && steps.length === 0) {
+      const synthStatus = status === "passed" ? "passed" : "failed";
+      const args = [
+        "run",
+        "case",
+        "step",
+        "set",
+        "--run-id",
+        this.runKey,
+        "--code",
+        code,
+        "--step",
+        "1",
+        "--status",
+        synthStatus,
+        "--example-cells",
+        exampleCellsArg,
+      ];
       this.fireAndForget(args);
     }
 
@@ -605,10 +717,18 @@ class ObservoReporter implements Reporter {
       ) {
         const codeIdx = verbArgs.indexOf("--code");
         const codeVal = codeIdx >= 0 ? verbArgs[codeIdx + 1] : "";
-        if (codeVal && !this.stepNotFoundWarnedFor.has(codeVal)) {
-          this.stepNotFoundWarnedFor.add(codeVal);
+        // OB-405 follow-up: include --example-cells in the dedup key so each
+        // parametrized example's over-count warning surfaces independently;
+        // before this the second example was silently suppressed because the
+        // first one already added the bare code to the set.
+        const cellsIdx = verbArgs.indexOf("--example-cells");
+        const cellsVal = cellsIdx >= 0 ? verbArgs[cellsIdx + 1] : "";
+        const dedupKey = cellsVal ? `${codeVal}:${cellsVal}` : codeVal;
+        if (codeVal && !this.stepNotFoundWarnedFor.has(dedupKey)) {
+          this.stepNotFoundWarnedFor.add(dedupKey);
+          const exampleSuffix = cellsVal ? ` (example ${cellsVal})` : "";
           this.warn(
-            `${codeVal}: spec emits more test.step()s than the case has step rows — over-count steps skipped (this is fine).`,
+            `${codeVal}${exampleSuffix}: spec emits more test.step()s than the case has step rows — over-count steps skipped (this is fine).`,
           );
         }
         return;
