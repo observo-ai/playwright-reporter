@@ -553,10 +553,9 @@ class ObservoReporter implements Reporter {
         // run-level strip. Earlier reporter versions stripped --code
         // because CLI v0.7.x rejected it (OB-373); CLI v0.8.0 added a
         // proper --case flag (`observo run attach --case OB-55 …`), so
-        // we route to the case whenever the @observo:CODE tag gave us
-        // one. Falls back to run-level only if extractShortCode()
-        // somehow returned empty (shouldn't happen — the early return
-        // at the top of onTestEnd already bails on missing code).
+        // we now route to the case unconditionally — the early return
+        // at the top of onTestEnd already guarantees `code` is
+        // non-empty by the time the attach loop runs.
         //
         // Parametrized cases (observo-cells annotation) still resolve
         // to the case as a whole here: CLI `run attach` doesn't yet
