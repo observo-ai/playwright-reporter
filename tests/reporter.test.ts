@@ -608,6 +608,70 @@ describe("OB-436: run attach routes to case (not run-level)", () => {
     const files = attaches.map((c) => c.args[c.args.indexOf("--file") + 1]).sort();
     expect(files).toEqual(["/tmp/shot.png", "/tmp/trace.zip"]);
   });
+
+  // OB-437: parametrized attach. When the spec has an observo-cells
+  // annotation, the reporter must also pass --example-cells on every
+  // run attach call so the upload lands on the correct example row of
+  // the parametrized case. Mirror of the case-step PATCH pattern in
+  // run_case_test.go and the run_attach CLI test in observo-cli.
+  it("passes --example-cells when the spec has an observo-cells annotation", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onTestEnd(
+      fakeTest({
+        tags: ["@observo:PARAM-3"],
+        annotations: [
+          { type: "observo-cells", description: JSON.stringify({ browser: "firefox" }) },
+        ],
+      }),
+      fakeResult({
+        status: "failed",
+        attachments: [
+          { name: "trace", path: "/tmp/trace.zip" },
+          { name: "screenshot", path: "/tmp/shot.png" },
+        ],
+      }),
+    );
+    const attaches = spawnCalls.filter((c) => c.args.includes("attach"));
+    expect(attaches.length).toBe(2);
+    for (const attach of attaches) {
+      const idx = attach.args.indexOf("--example-cells");
+      expect(idx, "attach call missing --example-cells").toBeGreaterThanOrEqual(0);
+      // Adjacent value, exact JSON match — server compares cells as a
+      // structured map; the wire form is what the CLI parses.
+      expect(JSON.parse(attach.args[idx + 1])).toEqual({ browser: "firefox" });
+      // --case must still be present (cells disambiguate AMONG example
+      // rows of a specific case; the case identity is required).
+      expect(attach.args).toContain("--case");
+      expect(attach.args).toContain("PARAM-3");
+    }
+  });
+
+  // OB-437: classic (non-parametrized) cases keep the v0.2.2 shape —
+  // --example-cells must NOT be passed on attach when the spec has no
+  // observo-cells annotation, otherwise older CLI/server versions
+  // (pre-v0.8.1) would reject the call as an unknown flag and the
+  // upload would drop.
+  it("omits --example-cells when the spec has no observo-cells annotation", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        attachments: [{ name: "trace", path: "/tmp/trace.zip" }],
+      }),
+    );
+    const attach = spawnCalls.find((c) => c.args.includes("attach"));
+    expect(attach).toBeTruthy();
+    expect(attach!.args).not.toContain("--example-cells");
+  });
 });
 
 describe("OB-373: step-number 404 is benign (deduped per case)", () => {
