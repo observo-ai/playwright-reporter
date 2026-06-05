@@ -549,19 +549,15 @@ class ObservoReporter implements Reporter {
           }
           continue;
         }
-        // OB-436: route attachments to the case drawer, not the
-        // run-level strip. Earlier reporter versions stripped --code
-        // because CLI v0.7.x rejected it (OB-373); CLI v0.8.0 added a
-        // proper --case flag (`observo run attach --case OB-55 …`), so
-        // we now route to the case unconditionally — the early return
-        // at the top of onTestEnd already guarantees `code` is
-        // non-empty by the time the attach loop runs.
-        //
-        // Parametrized cases (observo-cells annotation) still resolve
-        // to the case as a whole here: CLI `run attach` doesn't yet
-        // accept --example-cells. Tracked in OB-437 — once that lands,
-        // pass cellsJson through alongside --case (same pattern the
-        // case-step PATCH already uses on lines 459 / 484 / 524).
+        // OB-436: route attachments to the case drawer (--case flag,
+        // added in CLI v0.8.0). OB-437: when the spec has an
+        // observo-cells annotation, also pass --example-cells so the
+        // upload lands on the SPECIFIC example row of a parametrized
+        // case — same pattern the case / case-step PATCHes already use
+        // above (lines 459 / 484 / 524). Requires CLI v0.8.1+ on the
+        // resolver path; older CLIs reject --example-cells as an
+        // unknown flag and the upload drops (already covered by the
+        // CI install-pin bump in observo/PR #411).
         const args = [
           "run",
           "attach",
@@ -572,6 +568,7 @@ class ObservoReporter implements Reporter {
           "--file",
           att.path,
         ];
+        if (exampleCellsArg) args.push("--example-cells", exampleCellsArg);
         this.fireAndForget(args);
       }
     }
