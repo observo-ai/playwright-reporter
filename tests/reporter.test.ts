@@ -101,6 +101,7 @@ function fakeResult(opts: {
   steps?: any[];
   attachments?: any[];
   error?: { message?: string; stack?: string };
+  errors?: { message?: string; stack?: string }[];
 }): any {
   return {
     status: opts.status || "passed",
@@ -108,6 +109,7 @@ function fakeResult(opts: {
     steps: opts.steps || [],
     attachments: opts.attachments || [],
     error: opts.error,
+    errors: opts.errors,
   };
 }
 
@@ -1140,5 +1142,250 @@ describe("OB-434: onEnd drains in-flight fire-and-forget uploads", () => {
       elapsed,
       `expected onEnd to await pending children (>=60ms), got ${elapsed}ms`,
     ).toBeGreaterThanOrEqual(60);
+  });
+});
+
+// -----------------------------------------------------------------
+// OB-396 — failure OUTSIDE test.step() nodes (browser launch fail,
+// beforeAll throw, top-level timeout) used to drop ALL error context:
+// the case row landed as failed, every step row stayed green, no
+// message. Reporter now synthesises a step-1 write carrying
+// result.error / result.errors[0].message so the cause reaches the
+// dashboard.
+// -----------------------------------------------------------------
+
+describe("OB-396: top-level error surfaces as synthetic step-1", () => {
+  // Helper — locate the step-1 set call (classic or parametrized).
+  function findStepSet(code: string): { args: string[] } | undefined {
+    return spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set") &&
+        c.args.includes(code),
+    );
+  }
+
+  it("classic + failed + zero steps + result.error: synth step-1 with --comment", async () => {
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [],
+        error: {
+          message: "browserType.launch: Executable doesn't exist at /ms-playwright/firefox-1466/firefox/firefox",
+        },
+      }),
+    );
+
+    const stepSet = findStepSet("WEB-7");
+    expect(stepSet, "synth step-1 must fire").toBeTruthy();
+    expect(stepSet!.args[stepSet!.args.indexOf("--step") + 1]).toBe("1");
+    expect(stepSet!.args[stepSet!.args.indexOf("--status") + 1]).toBe("failed");
+    expect(stepSet!.args).toContain("--comment");
+    expect(stepSet!.args[stepSet!.args.indexOf("--comment") + 1]).toMatch(
+      /browserType\.launch/,
+    );
+    // Classic case — no --example-cells.
+    expect(stepSet!.args).not.toContain("--example-cells");
+  });
+
+  it("classic + timedOut + zero steps + result.error: synth step-1 status=failed", async () => {
+    // timedOut maps to "blocked" at the case level but the step
+    // endpoint only accepts passed/failed — collapse to failed (same
+    // rule the OB-405 parametrized synth uses).
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "timedOut",
+        steps: [],
+        error: { message: "Test timeout of 30000ms exceeded." },
+      }),
+    );
+
+    const stepSet = findStepSet("WEB-7");
+    expect(stepSet, "synth step-1 must fire on timedOut too").toBeTruthy();
+    expect(stepSet!.args[stepSet!.args.indexOf("--status") + 1]).toBe("failed");
+    expect(stepSet!.args[stepSet!.args.indexOf("--comment") + 1]).toMatch(
+      /Test timeout/,
+    );
+  });
+
+  it("falls back to result.errors[0].message when result.error.message is empty string", async () => {
+    // `||` not `??`: a blank `error.message` next to a non-blank
+    // `errors[0].message` must surface the latter, not the empty
+    // string (which would silently skip the synth).
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [],
+        error: { message: "" },
+        errors: [{ message: "fixture init: ECONNREFUSED" }],
+      }),
+    );
+
+    const stepSet = findStepSet("WEB-7");
+    expect(stepSet, "synth must fire from errors[] when error.message is blank").toBeTruthy();
+    expect(stepSet!.args[stepSet!.args.indexOf("--comment") + 1]).toMatch(
+      /ECONNREFUSED/,
+    );
+  });
+
+  it("falls back to result.errors[0].message when result.error is unset", async () => {
+    // Playwright populates result.errors[] even when result.error is
+    // sometimes absent (e.g. multi-error fixture failures); the reporter
+    // must read both shapes.
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [],
+        errors: [
+          { message: "beforeAll hook threw: ECONNREFUSED" },
+          { message: "secondary error" },
+        ],
+      }),
+    );
+
+    const stepSet = findStepSet("WEB-7");
+    expect(stepSet, "synth fires from errors[] fallback").toBeTruthy();
+    expect(stepSet!.args[stepSet!.args.indexOf("--comment") + 1]).toMatch(
+      /beforeAll hook threw/,
+    );
+  });
+
+  it("failed but result.error/errors missing: no synth (nothing to say)", async () => {
+    // Defensive: a broken upstream object should not produce a step
+    // write with no --comment — the per-step loop's contract is that
+    // every step write carries either pass/fail signal we actually own.
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({ status: "failed", steps: [] }),
+    );
+
+    const stepSet = findStepSet("WEB-7");
+    expect(stepSet, "no synth without an error message").toBeFalsy();
+    // Case-level set still fires so the row shows red.
+    const caseSet = spawnCalls.find(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("set") &&
+        !c.args.includes("step"),
+    );
+    expect(caseSet?.args).toContain("failed");
+  });
+
+  it("does NOT overwrite real per-step writes: skip synth when steps.length > 0", async () => {
+    // Mixed case: top-level error fired AND at least one user step
+    // ran. The per-step loop already carries the failing step's
+    // --comment; writing a synth step-1 would clobber the existing
+    // step-1 row (status / comment overwrite race). Restrict synth to
+    // the no-steps shape — documented limitation, covered by OB-397
+    // when case-level --comment becomes available.
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({ tags: ["@observo:WEB-7"] }),
+      fakeResult({
+        status: "failed",
+        steps: [
+          {
+            title: "click submit",
+            category: "test.step",
+            steps: [],
+            error: { message: "selector not found" },
+          },
+        ],
+        error: { message: "afterEach hook threw" },
+      }),
+    );
+
+    // Exactly ONE step-set call for step-1 — the per-step loop's, not
+    // a synth on top of it.
+    const stepSets = spawnCalls.filter(
+      (c) =>
+        c.args.includes("case") &&
+        c.args.includes("step") &&
+        c.args.includes("set"),
+    );
+    expect(stepSets).toHaveLength(1);
+    expect(stepSets[0].args[stepSets[0].args.indexOf("--comment") + 1]).toBe(
+      "selector not found",
+    );
+  });
+
+  it("parametrized + failed + zero steps + result.error: synth step-1 carries --comment AND --example-cells", async () => {
+    // Extends the OB-405 no-step parametrized synth: now also pushes
+    // --comment when result.error is present. Without this the example
+    // row landed as failed with zero context.
+    process.env.OBSERVO_API_KEY = "k";
+    process.env.OBSERVO_RUN_KEY = "RUN-99";
+    const r = new ObservoReporter();
+    await r.onBegin({} as any, {} as any);
+    spawnCalls.length = 0;
+
+    await r.onTestEnd(
+      fakeTest({
+        tags: ["@observo:PARAM-9"],
+        annotations: [
+          {
+            type: "observo-cells",
+            description: JSON.stringify({ browser: "firefox" }),
+          },
+        ],
+      }),
+      fakeResult({
+        status: "failed",
+        steps: [],
+        error: { message: "browserType.launch firefox failed" },
+      }),
+    );
+
+    const stepSet = findStepSet("PARAM-9");
+    expect(stepSet).toBeTruthy();
+    expect(stepSet!.args[stepSet!.args.indexOf("--status") + 1]).toBe("failed");
+    expect(stepSet!.args).toContain("--example-cells");
+    expect(
+      JSON.parse(stepSet!.args[stepSet!.args.indexOf("--example-cells") + 1]),
+    ).toEqual({ browser: "firefox" });
+    expect(stepSet!.args).toContain("--comment");
+    expect(stepSet!.args[stepSet!.args.indexOf("--comment") + 1]).toMatch(
+      /firefox failed/,
+    );
   });
 });

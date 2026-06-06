@@ -446,9 +446,9 @@ class ObservoReporter implements Reporter {
     // precedent: OB-373 finding #2 removed --comment for the same reason).
     //
     // OB-373 finding #2 historical note: previously appended `--comment` here
-    // but CLI v0.7.x did not declare it; the failure context survives via the
-    // per-step --comment we pass below + the orchestrator workflow's
-    // failure-summary.md attachment.
+    // but CLI v0.7.x did not declare it; OB-397 tracks lifting that contract.
+    // Until then, OB-396 below synthesises a step-1 write carrying the
+    // top-level message so failures OUTSIDE `test.step()` aren't silent.
     if (!exampleCells) {
       const caseArgs = [
         "run",
@@ -493,44 +493,95 @@ class ObservoReporter implements Reporter {
       this.fireAndForget(args);
     }
 
-    // OB-405 follow-up: parametrized case with ZERO test.step() calls.
-    // The case-level skip above would leave the example row at its initial
-    // not_started state forever — the rollup has nothing to roll up. Emit
-    // an overall-status write against step 1 of the targeted example so
-    // the example row picks up the run's outcome, analogous to how the
-    // classic path's `run case set` covers a no-steps test. If the case
-    // template has zero step rows the server returns "step number 1 not
-    // found" and the existing OB-373 dedup'd warning surfaces it.
+    // OB-396 + OB-405 follow-up: synthesise a step-1 write when the
+    // per-step loop above had nothing to write (no `test.step()` calls
+    // in the spec) so the case row carries SOME signal beyond the bare
+    // status set above. Two overlapping reasons cover the same shape:
     //
-    // Round 3 review: the step endpoint is constrained to "passed"/"failed"
-    // by the per-step loop above (line 462 — Playwright `test.step()` errors
-    // only yield those two). The case-level endpoint accepts the full
-    // {passed, failed, blocked, skipped} set; sending the full mapStatus
-    // output here would mirror that asymmetry. Collapse non-pass → "failed"
-    // to match the step-endpoint contract — a timedOut/blocked test surfaces
-    // as failure (which is what the user wants to see), and a skipped test
-    // also surfaces as failure with the cells in the row (less precise than
-    // a true skip, but the alternative is leaving the row stuck at
-    // not_started which reads as a silent reporter drop).
-    if (exampleCellsArg && steps.length === 0) {
-      const synthStatus = status === "passed" ? "passed" : "failed";
-      const args = [
-        "run",
-        "case",
-        "step",
-        "set",
-        "--run-id",
-        this.runKey,
-        "--code",
-        code,
-        "--step",
-        "1",
-        "--status",
-        synthStatus,
-        "--example-cells",
-        exampleCellsArg,
-      ];
-      this.fireAndForget(args);
+    //   OB-405 (parametrized): the case-level `run case set` was skipped
+    //   for parametrized cases, so the example row would be stuck at
+    //   not_started without this synthesised write. Always fires for
+    //   parametrized + no-steps regardless of outcome.
+    //
+    //   OB-396 (top-level error context): when the test failed OUTSIDE
+    //   its test.step() nodes — browser launch failure, beforeAll
+    //   throw, top-level timeout — `result.error` / `result.errors[]`
+    //   carry the actual cause. The case-level write above takes no
+    //   --comment (OB-373 finding #2), so without this synth the cause
+    //   never reaches the dashboard. Fires for failures even when the
+    //   case is NOT parametrized.
+    //
+    // Guard rails:
+    //   - `steps.length === 0` only — never overwrite a real per-step
+    //     write the loop above already emitted.
+    //   - If the case template has zero step rows the server returns
+    //     "step number 1 not found"; the existing OB-373 dedup'd
+    //     warning surfaces it once and stays silent thereafter.
+    //   - Step endpoint is constrained to "passed"/"failed" by the
+    //     per-step loop contract; collapse non-pass → "failed" so a
+    //     timedOut/blocked/skipped test surfaces as failure rather
+    //     than being silently rejected as an unknown step status.
+    // `||` (not `??`) so an empty-string `result.error.message` falls
+    // through to `result.errors[0].message`. Playwright normally keeps
+    // these in sync but a fixture failure can populate `errors[]` while
+    // leaving `error.message` blank — `??` would surface the blank and
+    // silently skip the synth.
+    const topLevelMessage =
+      result.error?.message || result.errors?.[0]?.message || "";
+    const isFailure = status === "failed" || status === "blocked";
+
+    if (steps.length === 0) {
+      // Classic, no-steps failure with top-level error — synth a step-1
+      // write so the failure cause lands on the case row. Skip when
+      // there's nothing to say (passed/skipped, or failed-with-no-error
+      // which only happens on broken result objects from upstream mocks).
+      if (!exampleCellsArg && isFailure && topLevelMessage) {
+        const args = [
+          "run",
+          "case",
+          "step",
+          "set",
+          "--run-id",
+          this.runKey,
+          "--code",
+          code,
+          "--step",
+          "1",
+          "--status",
+          "failed",
+          "--comment",
+          topLevelMessage,
+        ];
+        this.fireAndForget(args);
+      }
+
+      // Parametrized, no-steps — always emit so the example row picks up
+      // the outcome (OB-405). Append --comment when we have a top-level
+      // message (OB-396), same way the per-step loop carries failure
+      // context on classic specs.
+      if (exampleCellsArg) {
+        const synthStatus = status === "passed" ? "passed" : "failed";
+        const args = [
+          "run",
+          "case",
+          "step",
+          "set",
+          "--run-id",
+          this.runKey,
+          "--code",
+          code,
+          "--step",
+          "1",
+          "--status",
+          synthStatus,
+          "--example-cells",
+          exampleCellsArg,
+        ];
+        if (synthStatus === "failed" && topLevelMessage) {
+          args.push("--comment", topLevelMessage);
+        }
+        this.fireAndForget(args);
+      }
     }
 
     // 3. Attachments — only on failed/blocked unless uploadPassed.
@@ -554,10 +605,10 @@ class ObservoReporter implements Reporter {
         // observo-cells annotation, also pass --example-cells so the
         // upload lands on the SPECIFIC example row of a parametrized
         // case — same pattern the case / case-step PATCHes already use
-        // above (lines 459 / 484 / 524). Requires CLI v0.8.1+ on the
-        // resolver path; older CLIs reject --example-cells as an
-        // unknown flag and the upload drops (already covered by the
-        // CI install-pin bump in observo/PR #411).
+        // above. Requires CLI v0.8.1+ on the resolver path; older CLIs
+        // reject --example-cells as an unknown flag and the upload
+        // drops (already covered by the CI install-pin bump in
+        // observo/PR #411).
         const args = [
           "run",
           "attach",
